@@ -1,0 +1,8 @@
+{
+  "name": "나를 잘 표현하는 키워드 찾기",
+  "description": "아이들이 자신을 가장 잘 표현하는 키워드를 [생활], [인성], [학습] 영역에서 각각 최소 1개씩 총 5개를 선택하여 제출하고, 교사는 수합된 결과를 확인 및 CSV로 다운로드하고 생활기록부용 AI 추천 문구를 생성해주는 설문 시스템",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
