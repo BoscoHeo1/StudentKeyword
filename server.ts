@@ -4,7 +4,22 @@ import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import { StudentSubmission } from "./src/types";
+import pg from "pg";
+import { initializeApp } from "firebase/app";
+import { 
+  getFirestore, 
+  collection, 
+  getDocs, 
+  doc, 
+  setDoc, 
+  getDoc,
+  deleteDoc, 
+  query, 
+  orderBy,
+  writeBatch
+} from "firebase/firestore";
 
+const { Pool } = pg;
 const app = express();
 const PORT = 3000;
 const SUBMISSIONS_FILE = path.join(process.cwd(), "data", "submissions.json");
@@ -14,6 +29,81 @@ const CONFIG_FILE = path.join(process.cwd(), "data", "config.json");
 const dataDir = path.dirname(SUBMISSIONS_FILE);
 if (!fs.existsSync(dataDir)) {
   fs.mkdirSync(dataDir, { recursive: true });
+}
+
+// PostgreSQL Dynamic Connection Setup (Supabase / Neon Support)
+let dbPool: pg.Pool | null = null;
+const DATABASE_URL = process.env.DATABASE_URL;
+
+if (DATABASE_URL) {
+  console.log("DATABASE_URL found! Connecting to PostgreSQL (Supabase/Neon)...");
+  dbPool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: { rejectUnauthorized: false } // Required for Supabase/Neon production connections
+  });
+} else {
+  console.log("No DATABASE_URL found. Will check for Firebase Firestore or use local JSON fallback.");
+}
+
+// Firebase Firestore Connection Setup
+let firestoreDb: any = null;
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID;
+
+if (FIREBASE_PROJECT_ID) {
+  console.log("FIREBASE_PROJECT_ID found! Connecting to Firebase Firestore...");
+  try {
+    const firebaseConfig = {
+      apiKey: process.env.FIREBASE_API_KEY,
+      authDomain: process.env.FIREBASE_AUTH_DOMAIN,
+      projectId: FIREBASE_PROJECT_ID,
+      storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
+      messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID,
+      appId: process.env.FIREBASE_APP_ID
+    };
+    const firebaseApp = initializeApp(firebaseConfig);
+    firestoreDb = getFirestore(firebaseApp);
+    console.log("Firebase Firestore initialized successfully.");
+  } catch (error) {
+    console.error("Failed to initialize Firebase Firestore:", error);
+  }
+}
+
+// Automated PostgreSQL Schema Migration Helper
+async function initDatabase() {
+  if (!dbPool) return;
+  try {
+    const client = await dbPool.connect();
+    try {
+      // 1. Create submissions table
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS submissions (
+          id VARCHAR(50) PRIMARY KEY,
+          grade VARCHAR(10) NOT NULL,
+          class_number VARCHAR(10) NOT NULL,
+          student_number VARCHAR(10) NOT NULL,
+          name VARCHAR(50) NOT NULL,
+          keywords TEXT[] NOT NULL,
+          timestamp VARCHAR(50) NOT NULL,
+          ai_feedback TEXT NOT NULL,
+          report_card_draft TEXT NOT NULL
+        )
+      `);
+      
+      // 2. Create config table
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS config (
+          key VARCHAR(50) PRIMARY KEY,
+          value TEXT NOT NULL
+        )
+      `);
+      console.log("PostgreSQL database schemas verified successfully.");
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error("Failed to initialize PostgreSQL database, falling back to JSON:", error);
+    dbPool = null; // Fallback to local files if database is offline or misconfigured
+  }
 }
 
 // Config helper functions
@@ -36,6 +126,7 @@ function saveConfig(config: { adminPassword: string }) {
     console.error("Failed to write config file", error);
   }
 }
+
 
 // Korean name friendly calling helper
 function getFriendlyName(name: string): string {
@@ -277,6 +368,262 @@ function saveSubmissions(submissions: StudentSubmission[]): void {
   }
 }
 
+// ==========================================
+// ASYNC HYBRID DATABASE ACCESS LAYERS
+// ==========================================
+
+async function getSubmissionsAsync(): Promise<StudentSubmission[]> {
+  if (firestoreDb) {
+    try {
+      const submissionsCol = collection(firestoreDb, "submissions");
+      const q = query(submissionsCol);
+      const snapshot = await getDocs(q);
+      const items: StudentSubmission[] = [];
+      snapshot.forEach((docSnap) => {
+        const data = docSnap.data();
+        items.push({
+          id: docSnap.id,
+          grade: data.grade || "",
+          classNumber: data.classNumber || "",
+          studentNumber: data.studentNumber || "",
+          name: data.name || "",
+          keywords: data.keywords || [],
+          timestamp: data.timestamp || "",
+          aiFeedback: data.aiFeedback || "",
+          reportCardDraft: data.reportCardDraft || ""
+        });
+      });
+      // Sort desc by timestamp
+      items.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+      return items;
+    } catch (error) {
+      console.error("Failed to query submissions from Firebase Firestore, falling back:", error);
+    }
+  }
+  if (dbPool) {
+    try {
+      const result = await dbPool.query("SELECT * FROM submissions ORDER BY timestamp DESC");
+      return result.rows.map(row => ({
+        id: row.id,
+        grade: row.grade,
+        classNumber: row.class_number,
+        studentNumber: row.student_number,
+        name: row.name,
+        keywords: row.keywords,
+        timestamp: row.timestamp,
+        aiFeedback: row.ai_feedback,
+        reportCardDraft: row.report_card_draft
+      }));
+    } catch (error) {
+      console.error("Failed to query submissions from PostgreSQL, falling back to local JSON:", error);
+    }
+  }
+  return getSubmissions();
+}
+
+async function addSubmissionAsync(s: StudentSubmission): Promise<void> {
+  if (firestoreDb) {
+    try {
+      const docRef = doc(firestoreDb, "submissions", s.id);
+      await setDoc(docRef, {
+        grade: s.grade,
+        classNumber: s.classNumber,
+        studentNumber: s.studentNumber,
+        name: s.name,
+        keywords: s.keywords,
+        timestamp: s.timestamp,
+        aiFeedback: s.aiFeedback,
+        reportCardDraft: s.reportCardDraft
+      });
+      console.log(`Successfully added submission for ${s.name} into Firebase Firestore.`);
+      return;
+    } catch (error) {
+      console.error("Failed to insert submission into Firebase Firestore, falling back:", error);
+    }
+  }
+  if (dbPool) {
+    try {
+      await dbPool.query(
+        `INSERT INTO submissions (id, grade, class_number, student_number, name, keywords, timestamp, ai_feedback, report_card_draft)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [s.id, s.grade, s.classNumber, s.studentNumber, s.name, s.keywords, s.timestamp, s.aiFeedback, s.reportCardDraft]
+      );
+      console.log(`Successfully added submission for ${s.name} into PostgreSQL.`);
+      return;
+    } catch (error) {
+      console.error("Failed to insert submission into PostgreSQL, falling back to local JSON:", error);
+    }
+  }
+  
+  const current = getSubmissions();
+  current.push(s);
+  saveSubmissions(current);
+}
+
+async function updateSubmissionAsync(s: StudentSubmission): Promise<void> {
+  if (firestoreDb) {
+    try {
+      const docRef = doc(firestoreDb, "submissions", s.id);
+      await setDoc(docRef, {
+        grade: s.grade,
+        classNumber: s.classNumber,
+        studentNumber: s.studentNumber,
+        name: s.name,
+        keywords: s.keywords,
+        timestamp: s.timestamp,
+        aiFeedback: s.aiFeedback,
+        reportCardDraft: s.reportCardDraft
+      }, { merge: true });
+      console.log(`Successfully updated submission for ${s.name} in Firebase Firestore.`);
+      return;
+    } catch (error) {
+      console.error("Failed to update submission in Firebase Firestore, falling back:", error);
+    }
+  }
+  if (dbPool) {
+    try {
+      await dbPool.query(
+        `UPDATE submissions 
+         SET grade = $2, class_number = $3, student_number = $4, name = $5, keywords = $6, timestamp = $7, ai_feedback = $8, report_card_draft = $9
+         WHERE id = $1`,
+        [s.id, s.grade, s.classNumber, s.studentNumber, s.name, s.keywords, s.timestamp, s.aiFeedback, s.reportCardDraft]
+      );
+      console.log(`Successfully updated submission for ${s.name} in PostgreSQL.`);
+      return;
+    } catch (error) {
+      console.error("Failed to update submission in PostgreSQL, falling back to local JSON:", error);
+    }
+  }
+  
+  const submissions = getSubmissions();
+  const subIndex = submissions.findIndex((item) => item.id === s.id);
+  if (subIndex !== -1) {
+    submissions[subIndex] = s;
+    saveSubmissions(submissions);
+  }
+}
+
+async function deleteSubmissionAsync(id: string): Promise<boolean> {
+  if (firestoreDb) {
+    try {
+      const docRef = doc(firestoreDb, "submissions", id);
+      await deleteDoc(docRef);
+      console.log(`Successfully deleted submission ID ${id} from Firebase Firestore.`);
+      return true;
+    } catch (error) {
+      console.error("Failed to delete submission from Firebase Firestore, falling back:", error);
+    }
+  }
+  if (dbPool) {
+    try {
+      const result = await dbPool.query("DELETE FROM submissions WHERE id = $1", [id]);
+      console.log(`Successfully deleted submission ID ${id} from PostgreSQL.`);
+      return (result.rowCount ?? 0) > 0;
+    } catch (error) {
+      console.error("Failed to delete submission from PostgreSQL, falling back to local JSON:", error);
+    }
+  }
+  
+  const submissions = getSubmissions();
+  const filtered = submissions.filter((s) => s.id !== id);
+  if (submissions.length === filtered.length) {
+    return false;
+  }
+  saveSubmissions(filtered);
+  return true;
+}
+
+async function resetSubmissionsAsync(): Promise<void> {
+  if (firestoreDb) {
+    try {
+      const submissionsCol = collection(firestoreDb, "submissions");
+      const snapshot = await getDocs(submissionsCol);
+      const batch = writeBatch(firestoreDb);
+      snapshot.forEach((docSnap) => {
+        batch.delete(docSnap.ref);
+      });
+      await batch.commit();
+      console.log("Successfully cleared all submissions in Firebase Firestore.");
+      return;
+    } catch (error) {
+      console.error("Failed to clear submissions in Firebase Firestore, falling back:", error);
+    }
+  }
+  if (dbPool) {
+    try {
+      await dbPool.query("TRUNCATE TABLE submissions");
+      console.log("Successfully cleared all submissions in PostgreSQL.");
+      return;
+    } catch (error) {
+      console.error("Failed to truncate submissions in PostgreSQL, falling back to local JSON:", error);
+    }
+  }
+  saveSubmissions([]);
+}
+
+async function getConfigAsync(): Promise<{ adminPassword: string }> {
+  if (firestoreDb) {
+    try {
+      const docRef = doc(firestoreDb, "config", "adminPassword");
+      const docSnap = await getDoc(docRef);
+      if (docSnap.exists()) {
+        return { adminPassword: docSnap.data().value || "1234" };
+      } else {
+        const localConfig = getConfig();
+        await setDoc(docRef, { value: localConfig.adminPassword });
+        return localConfig;
+      }
+    } catch (error) {
+      console.error("Failed to query config from Firebase Firestore, falling back:", error);
+    }
+  }
+  if (dbPool) {
+    try {
+      const result = await dbPool.query("SELECT value FROM config WHERE key = 'adminPassword'");
+      if (result.rows.length > 0) {
+        return { adminPassword: result.rows[0].value };
+      } else {
+        const localConfig = getConfig();
+        await dbPool.query(
+          "INSERT INTO config (key, value) VALUES ('adminPassword', $1) ON CONFLICT (key) DO UPDATE SET value = $1",
+          [localConfig.adminPassword]
+        );
+        return localConfig;
+      }
+    } catch (error) {
+      console.error("Failed to query config from PostgreSQL, falling back to local JSON:", error);
+    }
+  }
+  return getConfig();
+}
+
+async function saveConfigAsync(config: { adminPassword: string }): Promise<void> {
+  if (firestoreDb) {
+    try {
+      const docRef = doc(firestoreDb, "config", "adminPassword");
+      await setDoc(docRef, { value: config.adminPassword }, { merge: true });
+      console.log("Successfully saved configuration in Firebase Firestore.");
+      return;
+    } catch (error) {
+      console.error("Failed to save config in Firebase Firestore, falling back:", error);
+    }
+  }
+  if (dbPool) {
+    try {
+      await dbPool.query(
+        "INSERT INTO config (key, value) VALUES ('adminPassword', $1) ON CONFLICT (key) DO UPDATE SET value = $1",
+        [config.adminPassword]
+      );
+      console.log("Successfully saved configuration in PostgreSQL.");
+      return;
+    } catch (error) {
+      console.error("Failed to save config in PostgreSQL, falling back to local JSON:", error);
+    }
+  }
+  saveConfig(config);
+}
+
+
 // Initialize Gemini Client
 let ai: GoogleGenAI | null = null;
 if (process.env.GEMINI_API_KEY) {
@@ -300,44 +647,42 @@ if (process.env.GEMINI_API_KEY) {
 app.use(express.json());
 
 // API: Get current config (password)
-app.get("/api/config", (req, res) => {
-  const config = getConfig();
+app.get("/api/config", async (req, res) => {
+  const config = await getConfigAsync();
   res.json(config);
 });
 
 // API: Update config (password)
-app.post("/api/config", (req, res) => {
+app.post("/api/config", async (req, res) => {
   const { adminPassword } = req.body;
   if (!adminPassword || adminPassword.trim().length === 0) {
     res.status(400).json({ success: false, message: "올바른 비밀번호를 입력해주세요." });
     return;
   }
-  saveConfig({ adminPassword: adminPassword.trim() });
+  await saveConfigAsync({ adminPassword: adminPassword.trim() });
   res.json({ success: true, message: "비밀번호가 성공적으로 변경되었습니다." });
 });
 
 // API: Get all submissions
-app.get("/api/submissions", (req, res) => {
-  const submissions = getSubmissions();
+app.get("/api/submissions", async (req, res) => {
+  const submissions = await getSubmissionsAsync();
   res.json(submissions);
 });
 
 // API: Delete a submission (for teacher dashboard management)
-app.delete("/api/submissions/:id", (req, res) => {
+app.delete("/api/submissions/:id", async (req, res) => {
   const { id } = req.params;
-  const submissions = getSubmissions();
-  const filtered = submissions.filter((s) => s.id !== id);
-  if (submissions.length === filtered.length) {
+  const success = await deleteSubmissionAsync(id);
+  if (!success) {
     res.status(404).json({ success: false, message: "Submission not found" });
     return;
   }
-  saveSubmissions(filtered);
   res.json({ success: true });
 });
 
 // API: Reset all submissions
-app.post("/api/submissions/reset", (req, res) => {
-  saveSubmissions([]);
+app.post("/api/submissions/reset", async (req, res) => {
+  await resetSubmissionsAsync();
   res.json({ success: true, message: "All submissions cleared." });
 });
 
@@ -351,7 +696,6 @@ app.post("/api/submissions", async (req, res) => {
     return;
   }
 
-  const submissions = getSubmissions();
   const newId = Date.now().toString();
 
   // Create base submission using robust rule-based generator
@@ -436,8 +780,7 @@ app.post("/api/submissions", async (req, res) => {
   newSubmission.aiFeedback = postProcessFeedback(newSubmission.aiFeedback, name);
   newSubmission.reportCardDraft = postProcessDraft(newSubmission.reportCardDraft);
 
-  submissions.push(newSubmission);
-  saveSubmissions(submissions);
+  await addSubmissionAsync(newSubmission);
 
   res.json({ success: true, submission: newSubmission });
 });
@@ -448,7 +791,7 @@ app.post("/api/submissions/:id/regenerate-ai", async (req, res) => {
   const { apiKey } = req.body;
   const clientApiKey = req.headers["x-gemini-api-key"] as string || apiKey;
 
-  const submissions = getSubmissions();
+  const submissions = await getSubmissionsAsync();
   const subIndex = submissions.findIndex((s) => s.id === id);
 
   if (subIndex === -1) {
@@ -518,8 +861,7 @@ app.post("/api/submissions/:id/regenerate-ai", async (req, res) => {
       student.aiFeedback = postProcessFeedback(student.aiFeedback, student.name);
       student.reportCardDraft = postProcessDraft(student.reportCardDraft);
 
-      submissions[subIndex] = student;
-      saveSubmissions(submissions);
+      await updateSubmissionAsync(student);
       res.json({ success: true, student });
       return;
     }
@@ -534,6 +876,8 @@ app.post("/api/submissions/:id/regenerate-ai", async (req, res) => {
 
 // Serve frontend assets
 async function startServer() {
+  await initDatabase();
+
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
