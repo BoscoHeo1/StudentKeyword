@@ -49,16 +49,16 @@ export default function Header({ currentMode, onChangeMode }: HeaderProps) {
     <header className="bg-white border-b border-slate-200 sticky top-0 z-40" id="header-container">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between" id="header-inner">
         {/* Brand / Logo */}
-        <div className="flex items-center space-x-3 cursor-pointer" onClick={() => onChangeMode("student")} id="header-brand">
-          <div className="w-10 h-10 bg-indigo-600 rounded-lg flex items-center justify-center text-white font-bold text-2xl" id="header-logo-container">
-            K
+        <div className="flex items-center space-x-3 cursor-pointer select-none" onClick={() => onChangeMode("student")} id="header-brand">
+          <div className="w-10 h-10 bg-gradient-to-tr from-pink-400 via-rose-400 to-indigo-500 rounded-[14px] flex items-center justify-center text-white font-black text-xl shadow-md shadow-pink-100 animate-pulse" id="header-logo-container">
+            🧸
           </div>
           <div>
-            <h1 className="font-sans font-bold text-lg text-slate-800 tracking-tight leading-tight" id="header-title">
-              EduForm <span className="text-indigo-600">Kids</span>
+            <h1 className="font-sans font-black text-base text-slate-800 tracking-tight leading-tight" id="header-title">
+              키워드 <span className="text-transparent bg-clip-text bg-gradient-to-r from-pink-500 to-indigo-600 font-extrabold">열쇠고리</span>
             </h1>
-            <p className="font-mono text-[10px] text-slate-400 uppercase tracking-widest" id="header-subtitle">
-              Finding My Keywords
+            <p className="font-sans text-[10px] text-slate-400 font-semibold uppercase tracking-wider" id="header-subtitle">
+              나의 빛나는 조각 찾기 ✨
             </p>
           </div>
         </div>

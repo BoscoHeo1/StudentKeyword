@@ -18,7 +18,7 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-800 font-sans antialiased flex flex-col justify-between" id="app-root">
+    <div className="min-h-screen bg-gradient-to-br from-[#fff5f5] via-[#f3f6ff] to-[#fffdf0] text-slate-800 font-sans antialiased flex flex-col justify-between" id="app-root">
       <div>
         {/* Universal header for navigation toggling */}
         <Header currentMode={mode} onChangeMode={(m) => setMode(m)} />
@@ -37,14 +37,14 @@ export default function App() {
       </div>
 
       {/* Sub Footer / Bottom Rail */}
-      <div className="h-12 bg-indigo-900 px-4 sm:px-8 flex items-center justify-between text-white/70 text-xs shrink-0" id="bottom-rail">
+      <div className="h-12 bg-[#1e1c31] px-4 sm:px-8 flex items-center justify-between text-white/75 text-xs shrink-0" id="bottom-rail">
         <div className="flex gap-4 sm:gap-6">
-          <span className="hover:text-white cursor-pointer transition">학생 참여 가이드</span>
-          <span className="hover:text-white cursor-pointer transition">교사용 매뉴얼</span>
-          <span className="hover:text-white cursor-pointer transition">개인정보 처리방침</span>
+          <span className="hover:text-pink-300 cursor-pointer transition">학생 참여 가이드</span>
+          <span className="hover:text-pink-300 cursor-pointer transition">교사용 매뉴얼</span>
+          <span className="hover:text-pink-300 cursor-pointer transition">개인정보 처리방침</span>
         </div>
-        <div className="font-medium">
-          최근 동기화: <span className="text-white">방금 전</span>
+        <div className="font-medium text-white/60">
+          최근 동기화: <span className="text-pink-200 font-semibold">실시간 동기화 중</span>
         </div>
       </div>
     </div>

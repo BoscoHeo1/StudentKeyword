@@ -59,6 +59,153 @@ function getFriendlyName(name: string): string {
   return `${callName}야`;
 }
 
+// Post-process report card draft to strictly adhere to the rules
+function postProcessDraft(draft: string): string {
+  if (!draft) return "";
+  
+  // 1. Remove all newlines and line breaks
+  let cleaned = draft.replace(/[\r\n]+/g, " ");
+  
+  // 2. Remove math symbols and English letters (preserving units like cm, kg, m, g, etc.)
+  // Replace mathematical characters
+  cleaned = cleaned.replace(/\+/g, " 덧셈 ");
+  cleaned = cleaned.replace(/-/g, " 뺄셈 ");
+  cleaned = cleaned.replace(/X/g, " 곱셈 ");
+  cleaned = cleaned.replace(/\*/g, " 곱셈 ");
+  cleaned = cleaned.replace(/\//g, " 나눗셈 ");
+  cleaned = cleaned.replace(/=/g, " 같음 ");
+  
+  // Protect measuring units (case insensitive)
+  const units = ["cm", "kg", "mm", "ml", "km", "kg", "g", "m", "l"];
+  const placeholders: string[] = [];
+  units.forEach((unit, idx) => {
+    const regex = new RegExp(`\\b${unit}\\b`, "gi");
+    const placeholder = `__UNIT_PLACEHOLDER_${idx}__`;
+    placeholders.push(placeholder);
+    cleaned = cleaned.replace(regex, placeholder);
+  });
+  
+  // Remove any remaining English alphabet characters
+  cleaned = cleaned.replace(/[a-zA-Z]/g, "");
+  
+  // Restore measuring units
+  units.forEach((unit, idx) => {
+    const placeholder = `__UNIT_PLACEHOLDER_${idx}__`;
+    cleaned = cleaned.replace(new RegExp(placeholder, "g"), unit);
+  });
+
+  // 3. Normalize multiple spaces to single spaces
+  cleaned = cleaned.replace(/\s+/g, " ").trim();
+
+  // 4. Force sentence-endings to follow Korean rules (~함., ~임.)
+  cleaned = cleaned.replace(/합니다\./g, "함.");
+  cleaned = cleaned.replace(/입니다\./g, "임.");
+  cleaned = cleaned.replace(/가지고 있습니다\./g, "지님.");
+  cleaned = cleaned.replace(/있습니다\./g, "임.");
+  cleaned = cleaned.replace(/보여줍니다\./g, "보임.");
+  cleaned = cleaned.replace(/태도를 보임\./g, "태도가 우수함.");
+  cleaned = cleaned.replace(/행동을 보여줌\./g, "모습을 보임.");
+  cleaned = cleaned.replace(/할 수 있음\./g, "함.");
+  cleaned = cleaned.replace(/수 있음\./g, "함.");
+  cleaned = cleaned.replace(/있음\./g, "임.");
+  cleaned = cleaned.replace(/돋보입니다\./g, "돋보임.");
+  cleaned = cleaned.replace(/우수합니다\./g, "우수함.");
+  cleaned = cleaned.replace(/뛰어납니다\./g, "뛰어남.");
+  cleaned = cleaned.replace(/참여합니다\./g, "참여함.");
+  cleaned = cleaned.replace(/노력합니다\./g, "노력함.");
+  cleaned = cleaned.replace(/바람직합니다\./g, "바람직함.");
+  cleaned = cleaned.replace(/적극적입니다\./g, "적극적임.");
+  cleaned = cleaned.replace(/성실합니다\./g, "성실함.");
+  cleaned = cleaned.replace(/노력형입니다\./g, "노력형임.");
+  cleaned = cleaned.replace(/모습입니다\./g, "모습임.");
+
+  // Split into sentences
+  let sentences = cleaned.split(/(?<=\.)\s+/);
+  sentences = sentences.map(s => {
+    s = s.trim();
+    if (!s) return "";
+    
+    // Ensure period
+    if (!s.endsWith(".")) {
+      s += ".";
+    }
+    
+    // Strict end check - must end in 함. or 임.
+    if (!s.endsWith("함.") && !s.endsWith("임.")) {
+      if (s.endsWith("음.")) {
+        if (!s.endsWith("함.") && !s.endsWith("임.")) {
+          s = s.slice(0, -2) + "함.";
+        }
+      } else {
+        s = s.slice(0, -1) + "함.";
+      }
+    }
+    return s;
+  });
+  
+  return sentences.filter(Boolean).join(" ");
+}
+
+// Post-process student feedback to use friendly vocative
+function postProcessFeedback(feedback: string, name: string): string {
+  if (!feedback) return "";
+  let cleaned = feedback.trim();
+  
+  const friendlyName = getFriendlyName(name);
+  
+  // Replace generic names and titles
+  cleaned = cleaned.replace(new RegExp(`${name}\\s*(어린이|친구|학생)?`, "g"), friendlyName);
+  cleaned = cleaned.replace(new RegExp(`${name.substring(1)}\\s*(어린이|친구|학생)?`, "g"), friendlyName);
+  cleaned = cleaned.replace(/어린이/g, "친구");
+  
+  // Ensure the feedback starts with the friendly name
+  if (!cleaned.startsWith(friendlyName)) {
+    cleaned = cleaned.replace(/^[^a-zA-Z0-9가-힣]+/, "");
+    cleaned = `${friendlyName}! ${cleaned}`;
+  }
+  
+  return cleaned;
+}
+
+// Rule-based high-quality fallback generator
+function generateFallbackText(name: string, keywords: string[]): { aiFeedback: string; reportCardDraft: string } {
+  const friendlyName = getFriendlyName(name);
+  const k1 = keywords[0] || "따뜻한 배려";
+  const k2 = keywords[1] || "성실함";
+  const k3 = keywords[2] || "책임감";
+  const k4 = keywords[3] || "자기주도성";
+  const k5 = keywords[4] || "원만한 관계";
+
+  const aiFeedback = `${friendlyName}! 직접 고른 아름다운 키워드인 '${k1}', '${k2}', '${k3}'처럼 스스로에 대한 깊은 가치와 재능을 믿고 성실히 나아가는 모습이 정말 대견하고 기특해. 늘 밝고 예쁜 웃음과 함께 너의 큰 꿈을 멋지게 이루어 나가길 온 마음 다해 응원할게!`;
+
+  const s1 = `학급 공동체 속에서 주변 동료들을 배려하고 이해하려는 마음가짐으로 타인과 조화롭게 소통함.`;
+  const s2 = `자신이 선택한 가치들을 마음속에 품고서 매 학급 활동마다 성실하고 끈기 있게 참여하는 학습 태도가 돋보임.`;
+  const s3 = `주어진 과제를 스스로 계획하여 끝까지 완수해내는 훌륭한 자기주도성과 책임감 있는 성향을 지님.`;
+  const s4 = `풍부한 공감 능력을 바탕으로 교우들의 생각에 귀를 기울이며 긍정적인 사회성과 성장의 잠재력을 두루 갖춘 모범적인 학생임.`;
+
+  const reportCardDraft = `${s1} ${s2} ${s3} ${s4}`;
+  return { aiFeedback, reportCardDraft };
+}
+
+// Initialize dynamic Gemini Client resolver
+function getGeminiClient(customKey?: string): GoogleGenAI | null {
+  const key = customKey || process.env.GEMINI_API_KEY;
+  if (!key) return null;
+  try {
+    return new GoogleGenAI({
+      apiKey: key,
+      httpOptions: {
+        headers: {
+          "User-Agent": "aistudio-build",
+        },
+      },
+    });
+  } catch (e) {
+    console.error("Failed to initialize Gemini Client", e);
+    return null;
+  }
+}
+
 // In-memory or file-backed database helper
 function getSubmissions(): StudentSubmission[] {
   try {
@@ -196,7 +343,8 @@ app.post("/api/submissions/reset", (req, res) => {
 
 // API: Submit survey
 app.post("/api/submissions", async (req, res) => {
-  const { grade, classNumber, studentNumber, name, keywords } = req.body;
+  const { grade, classNumber, studentNumber, name, keywords, apiKey } = req.body;
+  const clientApiKey = req.headers["x-gemini-api-key"] as string || apiKey;
 
   if (!grade || !classNumber || !studentNumber || !name || !keywords || keywords.length !== 5) {
     res.status(400).json({ success: false, message: "모든 항목을 올바르게 채워주세요. (키워드는 정확히 5개)" });
@@ -206,8 +354,8 @@ app.post("/api/submissions", async (req, res) => {
   const submissions = getSubmissions();
   const newId = Date.now().toString();
 
-  // Create base submission
-  const friendlyName = getFriendlyName(name);
+  // Create base submission using robust rule-based generator
+  const fallback = generateFallbackText(name, keywords);
   const newSubmission: StudentSubmission = {
     id: newId,
     grade,
@@ -216,12 +364,15 @@ app.post("/api/submissions", async (req, res) => {
     name,
     keywords,
     timestamp: new Date().toISOString(),
-    aiFeedback: `안녕, ${friendlyName}! 직접 고른 다섯 가지 멋진 열쇠고리 키워드처럼 스스로의 다양한 가능성을 넓혀나가는 멋진 모습을 보여주어 정말 기뻐. 앞으로도 너의 멋진 꿈을 활짝 펼치기를 항상 마음 깊이 응원할게!`,
-    reportCardDraft: `학급 공동체 활동 시 타인을 배려하고 존중하는 노력이 우수함. 평소 주어진 과제에 높은 흥미를 보이며 적극적이고 자기주도적으로 성실하게 참여함. 매사 올바른 행동을 실천하기 위해 노력하는 태도가 돋보이며 친구들과의 소통 활동에서도 깊은 이타심과 긍정적인 리더십을 발휘함.`
+    aiFeedback: fallback.aiFeedback,
+    reportCardDraft: fallback.reportCardDraft
   };
 
+  // Get dynamic Gemini client
+  const activeAi = getGeminiClient(clientApiKey);
+
   // Enhance with Gemini if key is active
-  if (ai) {
+  if (activeAi) {
     try {
       const keywordsStr = keywords.join(", ");
       const prompt = `
@@ -254,7 +405,7 @@ app.post("/api/submissions", async (req, res) => {
 4. 학생이 선택한 5가지 키워드를 그대로 문장 속에 Verbatim(토씨 하나 안 틀리고 그대로)으로 나열하지 마십시오. 그 키워드의 의미와 표현을 문장 속에 잘 녹여내어 자연스럽고 아름답게 활용하여 고품질의 관찰 서술 문장으로 다듬어 작성하십시오. (글자 수: 공백 포함 약 150자 ~ 220자 사이)
 `;
 
-      const response = await ai.models.generateContent({
+      const response = await activeAi.models.generateContent({
         model: "gemini-3.5-flash",
         contents: prompt,
         config: {
@@ -266,8 +417,12 @@ app.post("/api/submissions", async (req, res) => {
       if (responseText) {
         try {
           const result = JSON.parse(responseText.trim());
-          if (result.aiFeedback) newSubmission.aiFeedback = result.aiFeedback;
-          if (result.reportCardDraft) newSubmission.reportCardDraft = result.reportCardDraft;
+          if (result.aiFeedback) {
+            newSubmission.aiFeedback = postProcessFeedback(result.aiFeedback, name);
+          }
+          if (result.reportCardDraft) {
+            newSubmission.reportCardDraft = postProcessDraft(result.reportCardDraft);
+          }
         } catch (parseError) {
           console.error("Failed to parse Gemini JSON output, using default drafts", parseError, responseText);
         }
@@ -276,6 +431,10 @@ app.post("/api/submissions", async (req, res) => {
       console.error("Gemini API execution failed, utilizing rich local fallback drafts", apiError);
     }
   }
+
+  // Double check our post-processing filters on the final output to guarantee compliance 100%
+  newSubmission.aiFeedback = postProcessFeedback(newSubmission.aiFeedback, name);
+  newSubmission.reportCardDraft = postProcessDraft(newSubmission.reportCardDraft);
 
   submissions.push(newSubmission);
   saveSubmissions(submissions);
@@ -286,6 +445,9 @@ app.post("/api/submissions", async (req, res) => {
 // API: Manually request AI Draft generation for a specific existing student
 app.post("/api/submissions/:id/regenerate-ai", async (req, res) => {
   const { id } = req.params;
+  const { apiKey } = req.body;
+  const clientApiKey = req.headers["x-gemini-api-key"] as string || apiKey;
+
   const submissions = getSubmissions();
   const subIndex = submissions.findIndex((s) => s.id === id);
 
@@ -295,15 +457,15 @@ app.post("/api/submissions/:id/regenerate-ai", async (req, res) => {
   }
 
   const student = submissions[subIndex];
+  const activeAi = getGeminiClient(clientApiKey);
 
-  if (!ai) {
-    res.status(400).json({ success: false, message: "Gemini API key is not configured on the server." });
+  if (!activeAi) {
+    res.status(400).json({ success: false, message: "개인 Gemini API 키가 설정되어 있지 않습니다. 우측 상단의 '설정 및 API 키 관리'에서 본인의 API 키를 입력해주세요." });
     return;
   }
 
   try {
     const keywordsStr = student.keywords.join(", ");
-    const friendlyName = getFriendlyName(student.name);
     const prompt = `
 당신은 대한민국 초등학교/중학교 교사이자 다정한 어린이 상담사입니다.
 학생이 자신을 표현하는 5가지 핵심 키워드를 골랐습니다. 이 키워드를 기반으로 학생에게 주는 다정한 피드백 카드 내용과 교사가 생활기록부(행동특성 및 종합의견 또는 교과세특)에 기재할 수 있는 고품질 추천 초안 문구를 작성해주세요.
@@ -334,7 +496,7 @@ app.post("/api/submissions/:id/regenerate-ai", async (req, res) => {
 4. 학생이 선택한 5가지 키워드를 그대로 문장 속에 Verbatim(토씨 하나 안 틀리고 그대로)으로 나열하지 마십시오. 그 키워드의 의미 and 표현을 문장 속에 잘 녹여내어 자연스럽고 아름답게 활용하여 고품질의 관찰 서술 문장으로 다듬어 작성하십시오. (글자 수: 공백 포함 약 150자 ~ 220자 사이)
 `;
 
-    const response = await ai.models.generateContent({
+    const response = await activeAi.models.generateContent({
       model: "gemini-3.5-flash",
       contents: prompt,
       config: {
@@ -345,9 +507,17 @@ app.post("/api/submissions/:id/regenerate-ai", async (req, res) => {
     const responseText = response.text;
     if (responseText) {
       const result = JSON.parse(responseText.trim());
-      if (result.aiFeedback) student.aiFeedback = result.aiFeedback;
-      if (result.reportCardDraft) student.reportCardDraft = result.reportCardDraft;
+      if (result.aiFeedback) {
+        student.aiFeedback = postProcessFeedback(result.aiFeedback, student.name);
+      }
+      if (result.reportCardDraft) {
+        student.reportCardDraft = postProcessDraft(result.reportCardDraft);
+      }
       
+      // Secondary filter run to guarantee strict adherence to the rules
+      student.aiFeedback = postProcessFeedback(student.aiFeedback, student.name);
+      student.reportCardDraft = postProcessDraft(student.reportCardDraft);
+
       submissions[subIndex] = student;
       saveSubmissions(submissions);
       res.json({ success: true, student });
@@ -355,7 +525,7 @@ app.post("/api/submissions/:id/regenerate-ai", async (req, res) => {
     }
   } catch (error) {
     console.error("Failed to regenerate AI text", error);
-    res.status(500).json({ success: false, message: "AI 생성 중 오류가 발생했습니다." });
+    res.status(500).json({ success: false, message: "AI 생성 중 오류가 발생했습니다. 입력하신 API 키가 올바른지 확인해주세요." });
     return;
   }
 

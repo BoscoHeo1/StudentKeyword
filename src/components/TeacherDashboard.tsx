@@ -27,6 +27,10 @@ export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps)
   const [passwordChangeSuccess, setPasswordChangeSuccess] = useState(false);
   const [passwordChangeError, setPasswordChangeError] = useState("");
 
+  // Gemini API Key state (saved only inside local teacher browser)
+  const [localApiKey, setLocalApiKey] = useState<string>(() => localStorage.getItem("gemini_api_key") || "");
+  const [newApiKeyInput, setNewApiKeyInput] = useState<string>("");
+
   // Filter / Search states
   const [searchName, setSearchName] = useState("");
   const [filterClass, setFilterClass] = useState("all");
@@ -219,13 +223,26 @@ export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps)
   };
 
   const handleRegenerateAI = async (id: string) => {
+    if (!localApiKey) {
+      alert("선생님의 개인 Gemini API 키가 설정되어 있지 않습니다.\n우측 상단의 '비밀번호 및 API 설정'에서 본인의 API 키를 입력해주시면 AI 추천문구를 실시간으로 생성할 수 있습니다.");
+      setNewApiKeyInput("");
+      setShowPasswordSettings(true);
+      return;
+    }
     setRegeneratingId(id);
     try {
-      const res = await fetch(`/api/submissions/${id}/regenerate-ai`, { method: "POST" });
+      const res = await fetch(`/api/submissions/${id}/regenerate-ai`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-gemini-api-key": localApiKey
+        }
+      });
       if (res.ok) {
         setRefreshTrigger(prev => prev + 1);
       } else {
-        alert("AI 문구 재생성에 실패했습니다. 서버 설정을 확인해주세요.");
+        const data = await res.json().catch(() => ({}));
+        alert(data.message || "AI 문구 재생성에 실패했습니다. 입력하신 API 키가 올바른지 확인해주세요.");
       }
     } catch (e) {
       console.error(e);
@@ -293,35 +310,40 @@ export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps)
     document.body.removeChild(link);
   };
 
-  // Password Change handler
-  const handlePasswordChange = async (e: React.FormEvent) => {
+  // Settings Change handler (Password & Gemini API Key)
+  const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
     setPasswordChangeError("");
     setPasswordChangeSuccess(false);
 
-    if (!newPassword.trim()) {
-      setPasswordChangeError("새로운 비밀번호를 입력해주세요.");
-      return;
-    }
+    // 1. If password is typed, update it on the server
+    if (newPassword.trim()) {
+      try {
+        const res = await fetch("/api/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ adminPassword: newPassword.trim() })
+        });
 
-    try {
-      const res = await fetch("/api/config", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ adminPassword: newPassword.trim() })
-      });
-
-      if (res.ok) {
-        setPasswordChangeSuccess(true);
-        setTimeout(() => setShowPasswordSettings(false), 1500);
-      } else {
-        const errData = await res.json();
-        setPasswordChangeError(errData.message || "비밀번호 변경에 실패했습니다.");
+        if (!res.ok) {
+          const errData = await res.json();
+          setPasswordChangeError(errData.message || "비밀번호 변경에 실패했습니다.");
+          return;
+        }
+      } catch (err) {
+        console.error("Failed to change password", err);
+        setPasswordChangeError("서버와 연결할 수 없어 비밀번호를 변경하지 못했습니다.");
+        return;
       }
-    } catch (err) {
-      console.error("Failed to change password", err);
-      setPasswordChangeError("서버와의 연결이 끊어졌습니다.");
     }
+
+    // 2. Always update local Gemini API Key in localStorage
+    const cleanedKey = newApiKeyInput.trim();
+    localStorage.setItem("gemini_api_key", cleanedKey);
+    setLocalApiKey(cleanedKey);
+
+    setPasswordChangeSuccess(true);
+    setTimeout(() => setShowPasswordSettings(false), 1500);
   };
 
   return (
@@ -348,10 +370,23 @@ export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps)
             <RefreshCw className={`w-4 h-4 ${loading ? "animate-spin" : ""}`} id="refresh-icon" />
           </button>
           
+          {localApiKey ? (
+            <span className="text-xs font-bold text-emerald-700 bg-emerald-50 border border-emerald-150 px-3 py-2.5 rounded-xl flex items-center gap-1.5 shadow-sm" id="api-status-connected">
+              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+              <span>Gemini AI 연동됨</span>
+            </span>
+          ) : (
+            <span className="text-xs font-bold text-slate-500 bg-slate-50 border border-slate-200 px-3 py-2.5 rounded-xl flex items-center gap-1.5 shadow-sm" id="api-status-disconnected">
+              <span className="w-2 h-2 rounded-full bg-slate-300" />
+              <span>기본 피드백 (API 미연동)</span>
+            </span>
+          )}
+          
           <button
             onClick={() => {
               setShowPasswordSettings(true);
               setNewPassword("");
+              setNewApiKeyInput(localApiKey);
               setPasswordChangeSuccess(false);
               setPasswordChangeError("");
             }}
@@ -359,7 +394,7 @@ export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps)
             id="change-password-button"
           >
             <Settings className="w-4 h-4 text-slate-500" id="settings-icon" />
-            <span>비밀번호 설정</span>
+            <span>설정 및 API 관리</span>
           </button>
 
           <button
@@ -880,14 +915,14 @@ export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps)
         </div>
       )}
 
-      {/* Password Settings Modal */}
+      {/* Password & API Settings Modal */}
       {showPasswordSettings && (
         <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4 z-50 animate-fade-in" id="password-settings-modal-overlay">
           <div className="bg-white rounded-2xl max-w-sm w-full p-6 shadow-xl border border-slate-100" id="password-settings-modal">
             <div className="flex justify-between items-center border-b border-slate-100 pb-3 mb-4" id="password-settings-header">
               <h3 className="text-sm font-bold text-slate-800 flex items-center gap-2">
                 <Settings className="w-4 h-4 text-indigo-600" />
-                <span>교사용 전용 비밀번호 변경</span>
+                <span>환경설정 및 API 관리</span>
               </h3>
               <button 
                 onClick={() => setShowPasswordSettings(false)} 
@@ -903,26 +938,45 @@ export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps)
                 <div className="w-12 h-12 bg-green-50 text-green-500 rounded-full flex items-center justify-center mx-auto" id="password-success-icon-box">
                   <Check className="w-6 h-6" />
                 </div>
-                <p className="text-sm font-bold text-slate-700">비밀번호가 성공적으로 변경되었습니다!</p>
+                <p className="text-sm font-bold text-slate-700">설정이 성공적으로 저장되었습니다!</p>
                 <p className="text-xs text-slate-400">잠시 후 창이 자동으로 닫힙니다.</p>
               </div>
             ) : (
-              <form onSubmit={handlePasswordChange} className="space-y-4" id="password-settings-form">
+              <form onSubmit={handleSaveSettings} className="space-y-4" id="password-settings-form">
                 <p className="text-xs text-slate-500 leading-relaxed">
-                  설문 수합 결과를 안전하게 보관하기 위해 선생님만의 새로운 비밀번호를 설정할 수 있습니다. (기본 비밀번호: 1234)
+                  비밀번호를 바꿀 수 있으며, 개인 Gemini API 키를 로컬 브라우저에 직접 등록하여 사용하실 수 있습니다.
                 </p>
 
+                {/* Password Input */}
                 <div className="space-y-1.5" id="password-input-group">
-                  <label className="text-xs font-bold text-slate-600">새 비밀번호 입력</label>
+                  <label className="text-xs font-bold text-slate-600">대시보드 비밀번호 변경 (선택)</label>
                   <input
                     type="text"
-                    placeholder="새로운 비밀번호"
+                    placeholder="새 비밀번호 (미입력 시 유지)"
                     value={newPassword}
                     onChange={(e) => setNewPassword(e.target.value)}
                     className="w-full px-3.5 py-2.5 text-sm border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                    autoFocus
                     id="new-password-input"
                   />
+                </div>
+
+                {/* Gemini API Key Input */}
+                <div className="space-y-1.5" id="api-key-input-group">
+                  <label className="text-xs font-bold text-slate-600 flex items-center gap-1">
+                    <Key className="w-3.5 h-3.5 text-indigo-500" />
+                    <span>Gemini API Key 등록 (선택)</span>
+                  </label>
+                  <input
+                    type="password"
+                    placeholder="AIzaSy로 시작하는 API 키 입력"
+                    value={newApiKeyInput}
+                    onChange={(e) => setNewApiKeyInput(e.target.value)}
+                    className="w-full px-3.5 py-2.5 text-sm border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono"
+                    id="gemini-api-key-input"
+                  />
+                  <p className="text-[10px] text-slate-400 leading-normal">
+                    ※ API 키는 서버에 저장되지 않고 <strong>선생님의 개인 브라우저(LocalStorage)에만 안전하게 보관</strong>되어 AI 문구 실시간 생성/재생성 시에만 직접 대입되어 작동됩니다.
+                  </p>
                 </div>
 
                 {passwordChangeError && (
@@ -945,7 +999,7 @@ export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps)
                     className="flex-1 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold transition shadow-sm"
                     id="save-password-change"
                   >
-                    변경하기
+                    저장하기
                   </button>
                 </div>
               </form>
