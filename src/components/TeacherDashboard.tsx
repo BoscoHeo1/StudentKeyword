@@ -14,6 +14,7 @@ interface TeacherDashboardProps {
 }
 
 export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps) {
+  const [classCode] = useState(() => localStorage.getItem("teacher_class_code") || "default");
   const [submissions, setSubmissions] = useState<StudentSubmission[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshTrigger, setRefreshTrigger] = useState(0);
@@ -29,7 +30,7 @@ export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps)
 
   // Gemini API Key state (saved only inside local teacher browser)
   const [localApiKey, setLocalApiKey] = useState<string>(() => localStorage.getItem("gemini_api_key") || "");
-  const [newApiKeyInput, setNewApiKeyInput] = useState<string>("");
+  const [newApiKeyInput, setNewApiKeyInput] = useState<string>(() => localStorage.getItem("gemini_api_key") || "");
 
   // Filter / Search states
   const [searchName, setSearchName] = useState("");
@@ -56,7 +57,7 @@ export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps)
     const fetchSubmissions = async () => {
       setLoading(true);
       try {
-        const res = await fetch("/api/submissions");
+        const res = await fetch(`/api/submissions?classCode=${encodeURIComponent(classCode)}`);
         if (res.ok) {
           const data = await res.json();
           setSubmissions(data);
@@ -77,7 +78,7 @@ export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps)
     };
 
     fetchSubmissions();
-  }, [refreshTrigger, lastUpdated]);
+  }, [refreshTrigger, lastUpdated, classCode]);
 
   // Unique list of classes in current submissions
   const availableClasses = useMemo(() => {
@@ -236,7 +237,8 @@ export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps)
         headers: {
           "Content-Type": "application/json",
           "x-gemini-api-key": localApiKey
-        }
+        },
+        body: JSON.stringify({ classCode })
       });
       if (res.ok) {
         setRefreshTrigger(prev => prev + 1);
@@ -258,7 +260,11 @@ export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps)
       return;
     }
     try {
-      const res = await fetch("/api/submissions/reset", { method: "POST" });
+      const res = await fetch("/api/submissions/reset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ classCode })
+      });
       if (res.ok) {
         setSubmissions([]);
         setShowClearConfirm(false);
@@ -319,10 +325,13 @@ export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps)
     // 1. If password is typed, update it on the server
     if (newPassword.trim()) {
       try {
-        const res = await fetch("/api/config", {
+        const res = await fetch("/api/classes/update-password", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ adminPassword: newPassword.trim() })
+          body: JSON.stringify({
+            classCode,
+            newPassword: newPassword.trim()
+          })
         });
 
         if (!res.ok) {

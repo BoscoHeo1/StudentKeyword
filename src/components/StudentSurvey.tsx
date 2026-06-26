@@ -21,6 +21,7 @@ export default function StudentSurvey({ onSurveySubmitted }: StudentSurveyProps)
   const [classNumber, setClassNumber] = useState("");
   const [studentNumber, setStudentNumber] = useState("");
   const [name, setName] = useState("");
+  const [classCode, setClassCode] = useState("");
   const [infoError, setInfoError] = useState("");
 
   // Keyword Selection State
@@ -36,16 +37,29 @@ export default function StudentSurvey({ onSurveySubmitted }: StudentSurveyProps)
   const grades = ["1", "2", "3", "4", "5", "6"];
 
   // Form submission: Validate student info and move to keywords selection
-  const handleInfoSubmit = (e: React.FormEvent) => {
+  const handleInfoSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!grade || !classNumber || !studentNumber || !name.trim()) {
-      setInfoError("모든 빈칸을 채워주세요!");
+    if (!grade || !classNumber || !studentNumber || !name.trim() || !classCode.trim()) {
+      setInfoError("모든 빈칸을 채워주세요! (학급 코드도 입력해야 해요)");
       return;
     }
     if (isNaN(Number(classNumber)) || isNaN(Number(studentNumber))) {
       setInfoError("반과 번호는 숫자만 입력할 수 있어요.");
       return;
     }
+
+    try {
+      const res = await fetch(`/api/classes/check/${encodeURIComponent(classCode.trim().toLowerCase())}`);
+      const checkData = await res.json();
+      if (!checkData.exists) {
+        setInfoError("입력하신 학급 코드가 존재하지 않습니다. 선생님이 대시보드에서 등록하신 정확한 코드를 입력해주세요!");
+        return;
+      }
+    } catch (err) {
+      console.error("Failed to check class code", err);
+      // Let it slide if there is an error
+    }
+
     setInfoError("");
     setStep('keywords');
   };
@@ -125,7 +139,8 @@ export default function StudentSurvey({ onSurveySubmitted }: StudentSurveyProps)
           classNumber,
           studentNumber,
           name: name.trim(),
-          keywords: selectedKeywords.map(k => k.text)
+          keywords: selectedKeywords.map(k => k.text),
+          classCode: classCode.trim().toLowerCase()
         })
       });
 
@@ -160,6 +175,7 @@ export default function StudentSurvey({ onSurveySubmitted }: StudentSurveyProps)
     setName("");
     setClassNumber("");
     setStudentNumber("");
+    setClassCode("");
     setStep('info');
     setSubmittedData(null);
   };
@@ -269,6 +285,22 @@ export default function StudentSurvey({ onSurveySubmitted }: StudentSurveyProps)
                     onChange={(e) => setName(e.target.value)}
                     className="w-full px-5 py-4 bg-rose-50/20 border border-rose-100 rounded-2xl focus:outline-none focus:ring-2 focus:ring-pink-400 focus:bg-white text-lg font-black text-slate-800 transition-all shadow-inner"
                     id="name-input"
+                  />
+                </div>
+
+                {/* Class Code Input */}
+                <div className="space-y-2.5" id="input-group-class-code">
+                  <label className="text-sm font-bold text-slate-700 flex items-center space-x-1.5" id="label-class-code">
+                    <Key className="w-4 h-4 text-pink-500" id="class-code-icon" />
+                    <span>학급 코드 (선생님이 알려주신 코드)</span>
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="예) seoul301 (대소문자 구분 없음)"
+                    value={classCode}
+                    onChange={(e) => setClassCode(e.target.value)}
+                    className="w-full px-5 py-4 bg-rose-50/20 border border-rose-100 rounded-2xl focus:outline-none focus:ring-2 focus:ring-pink-400 focus:bg-white text-lg font-black text-slate-800 transition-all shadow-inner"
+                    id="class-code-input"
                   />
                 </div>
 

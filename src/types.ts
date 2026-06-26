@@ -8,6 +8,7 @@ export interface StudentSubmission {
   timestamp: string;     // 제출 시각
   aiFeedback?: string;   // 아이에게 주는 따뜻한 격려 메시지
   reportCardDraft?: string; // 교사용 학교생활기록부(교과세특/행발) AI 초안 추천 문구
+  classCode?: string;     // 학급 코드 / 선생님 코드 (선택/필수)
 }
 
 export interface SubmitResponse {

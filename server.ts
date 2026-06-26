@@ -88,12 +88,26 @@ async function initDatabase() {
           report_card_draft TEXT NOT NULL
         )
       `);
+
+      // Add class_code column to submissions if it doesn't exist
+      await client.query(`
+        ALTER TABLE submissions ADD COLUMN IF NOT EXISTS class_code VARCHAR(100) DEFAULT 'default'
+      `);
       
       // 2. Create config table
       await client.query(`
         CREATE TABLE IF NOT EXISTS config (
           key VARCHAR(50) PRIMARY KEY,
           value TEXT NOT NULL
+        )
+      `);
+
+      // 3. Create classes table
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS classes (
+          class_code VARCHAR(100) PRIMARY KEY,
+          password VARCHAR(100) NOT NULL,
+          created_at VARCHAR(100) NOT NULL
         )
       `);
       console.log("PostgreSQL database schemas verified successfully.");
@@ -372,7 +386,9 @@ function saveSubmissions(submissions: StudentSubmission[]): void {
 // ASYNC HYBRID DATABASE ACCESS LAYERS
 // ==========================================
 
-async function getSubmissionsAsync(): Promise<StudentSubmission[]> {
+async function getSubmissionsAsync(classCode?: string): Promise<StudentSubmission[]> {
+  const targetCode = classCode?.toLowerCase().trim() || "default";
+
   if (firestoreDb) {
     try {
       const submissionsCol = collection(firestoreDb, "submissions");
@@ -381,17 +397,21 @@ async function getSubmissionsAsync(): Promise<StudentSubmission[]> {
       const items: StudentSubmission[] = [];
       snapshot.forEach((docSnap) => {
         const data = docSnap.data();
-        items.push({
-          id: docSnap.id,
-          grade: data.grade || "",
-          classNumber: data.classNumber || "",
-          studentNumber: data.studentNumber || "",
-          name: data.name || "",
-          keywords: data.keywords || [],
-          timestamp: data.timestamp || "",
-          aiFeedback: data.aiFeedback || "",
-          reportCardDraft: data.reportCardDraft || ""
-        });
+        const subClassCode = data.classCode || "default";
+        if (subClassCode === targetCode) {
+          items.push({
+            id: docSnap.id,
+            grade: data.grade || "",
+            classNumber: data.classNumber || "",
+            studentNumber: data.studentNumber || "",
+            name: data.name || "",
+            keywords: data.keywords || [],
+            timestamp: data.timestamp || "",
+            aiFeedback: data.aiFeedback || "",
+            reportCardDraft: data.reportCardDraft || "",
+            classCode: subClassCode
+          });
+        }
       });
       // Sort desc by timestamp
       items.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
@@ -402,7 +422,10 @@ async function getSubmissionsAsync(): Promise<StudentSubmission[]> {
   }
   if (dbPool) {
     try {
-      const result = await dbPool.query("SELECT * FROM submissions ORDER BY timestamp DESC");
+      const result = await dbPool.query(
+        "SELECT * FROM submissions WHERE class_code = $1 ORDER BY timestamp DESC",
+        [targetCode]
+      );
       return result.rows.map(row => ({
         id: row.id,
         grade: row.grade,
@@ -412,16 +435,19 @@ async function getSubmissionsAsync(): Promise<StudentSubmission[]> {
         keywords: row.keywords,
         timestamp: row.timestamp,
         aiFeedback: row.ai_feedback,
-        reportCardDraft: row.report_card_draft
+        reportCardDraft: row.report_card_draft,
+        classCode: row.class_code
       }));
     } catch (error) {
       console.error("Failed to query submissions from PostgreSQL, falling back to local JSON:", error);
     }
   }
-  return getSubmissions();
+  return getSubmissions().filter(s => (s.classCode || "default") === targetCode);
 }
 
 async function addSubmissionAsync(s: StudentSubmission): Promise<void> {
+  const finalClassCode = s.classCode?.toLowerCase().trim() || "default";
+
   if (firestoreDb) {
     try {
       const docRef = doc(firestoreDb, "submissions", s.id);
@@ -433,7 +459,8 @@ async function addSubmissionAsync(s: StudentSubmission): Promise<void> {
         keywords: s.keywords,
         timestamp: s.timestamp,
         aiFeedback: s.aiFeedback,
-        reportCardDraft: s.reportCardDraft
+        reportCardDraft: s.reportCardDraft,
+        classCode: finalClassCode
       });
       console.log(`Successfully added submission for ${s.name} into Firebase Firestore.`);
       return;
@@ -444,9 +471,9 @@ async function addSubmissionAsync(s: StudentSubmission): Promise<void> {
   if (dbPool) {
     try {
       await dbPool.query(
-        `INSERT INTO submissions (id, grade, class_number, student_number, name, keywords, timestamp, ai_feedback, report_card_draft)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-        [s.id, s.grade, s.classNumber, s.studentNumber, s.name, s.keywords, s.timestamp, s.aiFeedback, s.reportCardDraft]
+        `INSERT INTO submissions (id, grade, class_number, student_number, name, keywords, timestamp, ai_feedback, report_card_draft, class_code)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [s.id, s.grade, s.classNumber, s.studentNumber, s.name, s.keywords, s.timestamp, s.aiFeedback, s.reportCardDraft, finalClassCode]
       );
       console.log(`Successfully added submission for ${s.name} into PostgreSQL.`);
       return;
@@ -456,11 +483,13 @@ async function addSubmissionAsync(s: StudentSubmission): Promise<void> {
   }
   
   const current = getSubmissions();
-  current.push(s);
+  current.push({ ...s, classCode: finalClassCode });
   saveSubmissions(current);
 }
 
 async function updateSubmissionAsync(s: StudentSubmission): Promise<void> {
+  const finalClassCode = s.classCode?.toLowerCase().trim() || "default";
+
   if (firestoreDb) {
     try {
       const docRef = doc(firestoreDb, "submissions", s.id);
@@ -472,7 +501,8 @@ async function updateSubmissionAsync(s: StudentSubmission): Promise<void> {
         keywords: s.keywords,
         timestamp: s.timestamp,
         aiFeedback: s.aiFeedback,
-        reportCardDraft: s.reportCardDraft
+        reportCardDraft: s.reportCardDraft,
+        classCode: finalClassCode
       }, { merge: true });
       console.log(`Successfully updated submission for ${s.name} in Firebase Firestore.`);
       return;
@@ -484,9 +514,9 @@ async function updateSubmissionAsync(s: StudentSubmission): Promise<void> {
     try {
       await dbPool.query(
         `UPDATE submissions 
-         SET grade = $2, class_number = $3, student_number = $4, name = $5, keywords = $6, timestamp = $7, ai_feedback = $8, report_card_draft = $9
+         SET grade = $2, class_number = $3, student_number = $4, name = $5, keywords = $6, timestamp = $7, ai_feedback = $8, report_card_draft = $9, class_code = $10
          WHERE id = $1`,
-        [s.id, s.grade, s.classNumber, s.studentNumber, s.name, s.keywords, s.timestamp, s.aiFeedback, s.reportCardDraft]
+        [s.id, s.grade, s.classNumber, s.studentNumber, s.name, s.keywords, s.timestamp, s.aiFeedback, s.reportCardDraft, finalClassCode]
       );
       console.log(`Successfully updated submission for ${s.name} in PostgreSQL.`);
       return;
@@ -498,7 +528,7 @@ async function updateSubmissionAsync(s: StudentSubmission): Promise<void> {
   const submissions = getSubmissions();
   const subIndex = submissions.findIndex((item) => item.id === s.id);
   if (subIndex !== -1) {
-    submissions[subIndex] = s;
+    submissions[subIndex] = { ...s, classCode: finalClassCode };
     saveSubmissions(submissions);
   }
 }
@@ -533,17 +563,25 @@ async function deleteSubmissionAsync(id: string): Promise<boolean> {
   return true;
 }
 
-async function resetSubmissionsAsync(): Promise<void> {
+async function resetSubmissionsAsync(classCode: string): Promise<void> {
+  const targetCode = classCode.toLowerCase().trim();
   if (firestoreDb) {
     try {
       const submissionsCol = collection(firestoreDb, "submissions");
       const snapshot = await getDocs(submissionsCol);
       const batch = writeBatch(firestoreDb);
+      let count = 0;
       snapshot.forEach((docSnap) => {
-        batch.delete(docSnap.ref);
+        const data = docSnap.data();
+        if ((data.classCode || "default") === targetCode) {
+          batch.delete(docSnap.ref);
+          count++;
+        }
       });
-      await batch.commit();
-      console.log("Successfully cleared all submissions in Firebase Firestore.");
+      if (count > 0) {
+        await batch.commit();
+      }
+      console.log(`Successfully cleared ${count} submissions for class ${targetCode} in Firebase Firestore.`);
       return;
     } catch (error) {
       console.error("Failed to clear submissions in Firebase Firestore, falling back:", error);
@@ -551,14 +589,124 @@ async function resetSubmissionsAsync(): Promise<void> {
   }
   if (dbPool) {
     try {
-      await dbPool.query("TRUNCATE TABLE submissions");
-      console.log("Successfully cleared all submissions in PostgreSQL.");
+      await dbPool.query("DELETE FROM submissions WHERE class_code = $1", [targetCode]);
+      console.log(`Successfully cleared submissions for class ${targetCode} in PostgreSQL.`);
       return;
     } catch (error) {
-      console.error("Failed to truncate submissions in PostgreSQL, falling back to local JSON:", error);
+      console.error("Failed to clear submissions in PostgreSQL, falling back to local JSON:", error);
     }
   }
-  saveSubmissions([]);
+  const current = getSubmissions();
+  const remaining = current.filter(s => (s.classCode || "default") !== targetCode);
+  saveSubmissions(remaining);
+}
+
+// ==========================================
+// CLASS CONFIGURATION ACCESS LAYERS
+// ==========================================
+
+interface ClassConfig {
+  classCode: string;
+  password: string;
+  createdAt: string;
+}
+
+function getLocalClasses(): Record<string, ClassConfig> {
+  try {
+    const CLASSES_FILE = path.join(process.cwd(), "data", "classes.json");
+    if (fs.existsSync(CLASSES_FILE)) {
+      return JSON.parse(fs.readFileSync(CLASSES_FILE, "utf-8"));
+    }
+  } catch (e) {
+    console.error("Error reading classes file:", e);
+  }
+  return {};
+}
+
+function saveLocalClasses(classes: Record<string, ClassConfig>) {
+  try {
+    const CLASSES_FILE = path.join(process.cwd(), "data", "classes.json");
+    fs.writeFileSync(CLASSES_FILE, JSON.stringify(classes, null, 2), "utf-8");
+  } catch (e) {
+    console.error("Error writing classes file:", e);
+  }
+}
+
+async function getClassAsync(classCode: string): Promise<ClassConfig | null> {
+  const targetCode = classCode.toLowerCase().trim();
+  if (firestoreDb) {
+    try {
+      const docRef = doc(firestoreDb, "classes", targetCode);
+      const docSnap = await getDoc(docRef);
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        return {
+          classCode: docSnap.id,
+          password: data.password || "",
+          createdAt: data.createdAt || ""
+        };
+      }
+    } catch (error) {
+      console.error("Failed to get class from Firebase Firestore:", error);
+    }
+  }
+  if (dbPool) {
+    try {
+      const result = await dbPool.query("SELECT * FROM classes WHERE class_code = $1", [targetCode]);
+      if (result.rows.length > 0) {
+        return {
+          classCode: result.rows[0].class_code,
+          password: result.rows[0].password,
+          createdAt: result.rows[0].created_at
+        };
+      }
+    } catch (error) {
+      console.error("Failed to get class from PostgreSQL:", error);
+    }
+  }
+  
+  const local = getLocalClasses();
+  return local[targetCode] || null;
+}
+
+async function saveClassAsync(classCode: string, password: string): Promise<void> {
+  const targetCode = classCode.toLowerCase().trim();
+  const pass = password.trim();
+  const now = new Date().toISOString();
+
+  if (firestoreDb) {
+    try {
+      const docRef = doc(firestoreDb, "classes", targetCode);
+      await setDoc(docRef, {
+        password: pass,
+        createdAt: now
+      }, { merge: true });
+      console.log(`Successfully saved class ${targetCode} in Firebase Firestore.`);
+      return;
+    } catch (error) {
+      console.error("Failed to save class in Firebase Firestore, falling back:", error);
+    }
+  }
+  if (dbPool) {
+    try {
+      await dbPool.query(
+        "INSERT INTO classes (class_code, password, created_at) VALUES ($1, $2, $3) ON CONFLICT (class_code) DO UPDATE SET password = $2",
+        [targetCode, pass, now]
+      );
+      console.log(`Successfully saved class ${targetCode} in PostgreSQL.`);
+      return;
+    } catch (error) {
+      console.error("Failed to save class in PostgreSQL, falling back to local JSON:", error);
+    }
+  }
+  
+  const local = getLocalClasses();
+  local[targetCode] = {
+    classCode: targetCode,
+    password: pass,
+    createdAt: now
+  };
+  saveLocalClasses(local);
 }
 
 async function getConfigAsync(): Promise<{ adminPassword: string }> {
@@ -644,15 +792,101 @@ if (process.env.GEMINI_API_KEY) {
   console.warn("GEMINI_API_KEY environment variable is missing. App will use fallback rule-based generation.");
 }
 
-app.use(express.json());
+app.use(express.json()); // Custom Class Code and Authentication Endpoints
 
-// API: Get current config (password)
+// API: Check if class exists
+app.get("/api/classes/check/:classCode", async (req, res) => {
+  const { classCode } = req.params;
+  if (!classCode || classCode.trim().length === 0) {
+    res.json({ exists: false });
+    return;
+  }
+  const cls = await getClassAsync(classCode);
+  res.json({ exists: !!cls });
+});
+
+// API: Authenticate class (Login or Auto-Register)
+app.post("/api/classes/auth", async (req, res) => {
+  const { classCode, password } = req.body;
+  if (!classCode || classCode.trim().length === 0 || !password || password.trim().length === 0) {
+    res.status(400).json({ success: false, message: "학급 코드와 비밀번호를 올바르게 입력해주세요." });
+    return;
+  }
+
+  const trimmedCode = classCode.toLowerCase().trim();
+  const trimmedPass = password.trim();
+
+  try {
+    const existingClass = await getClassAsync(trimmedCode);
+    if (existingClass) {
+      if (existingClass.password === trimmedPass) {
+        res.json({ success: true, isNew: false, message: "로그인에 성공했습니다." });
+      } else {
+        res.status(401).json({ success: false, message: "비밀번호가 일치하지 않습니다. 다시 입력해주세요." });
+      }
+    } else {
+      await saveClassAsync(trimmedCode, trimmedPass);
+      res.json({ success: true, isNew: true, message: "새로운 학급 대시보드가 성공적으로 개설되었습니다!" });
+    }
+  } catch (error) {
+    console.error("Auth error:", error);
+    res.status(500).json({ success: false, message: "로그인 처리 중 오류가 발생했습니다." });
+  }
+});
+
+// API: Change Class Password
+app.post("/api/classes/change-password", async (req, res) => {
+  const { classCode, oldPassword, newPassword } = req.body;
+  if (!classCode || !oldPassword || !newPassword || newPassword.trim().length === 0) {
+    res.status(400).json({ success: false, message: "모든 입력을 완료해주세요." });
+    return;
+  }
+
+  const trimmedCode = classCode.toLowerCase().trim();
+  try {
+    const existingClass = await getClassAsync(trimmedCode);
+    if (!existingClass) {
+      res.status(404).json({ success: false, message: "학급을 찾을 수 없습니다." });
+      return;
+    }
+
+    if (existingClass.password !== oldPassword.trim()) {
+      res.status(401).json({ success: false, message: "기존 비밀번호가 일치하지 않습니다." });
+      return;
+    }
+
+    await saveClassAsync(trimmedCode, newPassword.trim());
+    res.json({ success: true, message: "비밀번호가 성공적으로 변경되었습니다." });
+  } catch (error) {
+    console.error("Password change error:", error);
+    res.status(500).json({ success: false, message: "비밀번호 변경 중 오류가 발생했습니다." });
+  }
+});
+
+// API: Direct update class password (authenticated from browser state)
+app.post("/api/classes/update-password", async (req, res) => {
+  const { classCode, newPassword } = req.body;
+  if (!classCode || !newPassword || newPassword.trim().length === 0) {
+    res.status(400).json({ success: false, message: "학급 코드와 새 비밀번호를 올바르게 입력해주세요." });
+    return;
+  }
+  const trimmedCode = classCode.toLowerCase().trim();
+  try {
+    await saveClassAsync(trimmedCode, newPassword.trim());
+    res.json({ success: true, message: "비밀번호가 성공적으로 변경되었습니다." });
+  } catch (error) {
+    console.error("Update password error:", error);
+    res.status(500).json({ success: false, message: "비밀번호 변경 중 오류가 발생했습니다." });
+  }
+});
+
+// API: Get current config (password) - Keeping for backwards compatibility
 app.get("/api/config", async (req, res) => {
   const config = await getConfigAsync();
   res.json(config);
 });
 
-// API: Update config (password)
+// API: Update config (password) - Keeping for backwards compatibility
 app.post("/api/config", async (req, res) => {
   const { adminPassword } = req.body;
   if (!adminPassword || adminPassword.trim().length === 0) {
@@ -663,9 +897,10 @@ app.post("/api/config", async (req, res) => {
   res.json({ success: true, message: "비밀번호가 성공적으로 변경되었습니다." });
 });
 
-// API: Get all submissions
+// API: Get all submissions (optionally filtered by classCode)
 app.get("/api/submissions", async (req, res) => {
-  const submissions = await getSubmissionsAsync();
+  const { classCode } = req.query;
+  const submissions = await getSubmissionsAsync(classCode as string);
   res.json(submissions);
 });
 
@@ -680,15 +915,20 @@ app.delete("/api/submissions/:id", async (req, res) => {
   res.json({ success: true });
 });
 
-// API: Reset all submissions
+// API: Reset all submissions for a class
 app.post("/api/submissions/reset", async (req, res) => {
-  await resetSubmissionsAsync();
-  res.json({ success: true, message: "All submissions cleared." });
+  const { classCode } = req.body;
+  if (!classCode) {
+    res.status(400).json({ success: false, message: "학급 코드가 필요합니다." });
+    return;
+  }
+  await resetSubmissionsAsync(classCode);
+  res.json({ success: true, message: "submissions cleared for class: " + classCode });
 });
 
 // API: Submit survey
 app.post("/api/submissions", async (req, res) => {
-  const { grade, classNumber, studentNumber, name, keywords, apiKey } = req.body;
+  const { grade, classNumber, studentNumber, name, keywords, apiKey, classCode } = req.body;
   const clientApiKey = req.headers["x-gemini-api-key"] as string || apiKey;
 
   if (!grade || !classNumber || !studentNumber || !name || !keywords || keywords.length !== 5) {
@@ -709,7 +949,8 @@ app.post("/api/submissions", async (req, res) => {
     keywords,
     timestamp: new Date().toISOString(),
     aiFeedback: fallback.aiFeedback,
-    reportCardDraft: fallback.reportCardDraft
+    reportCardDraft: fallback.reportCardDraft,
+    classCode: classCode || "default"
   };
 
   // Get dynamic Gemini client
@@ -788,10 +1029,10 @@ app.post("/api/submissions", async (req, res) => {
 // API: Manually request AI Draft generation for a specific existing student
 app.post("/api/submissions/:id/regenerate-ai", async (req, res) => {
   const { id } = req.params;
-  const { apiKey } = req.body;
+  const { apiKey, classCode } = req.body;
   const clientApiKey = req.headers["x-gemini-api-key"] as string || apiKey;
 
-  const submissions = await getSubmissionsAsync();
+  const submissions = await getSubmissionsAsync(classCode);
   const subIndex = submissions.findIndex((s) => s.id === id);
 
   if (subIndex === -1) {

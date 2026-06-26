@@ -8,42 +8,62 @@ interface HeaderProps {
 
 export default function Header({ currentMode, onChangeMode }: HeaderProps) {
   const [showPasswordModal, setShowPasswordModal] = useState(false);
+  const [classCodeInput, setClassCodeInput] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
-  const [serverPassword, setServerPassword] = useState("1234");
-
-  React.useEffect(() => {
-    if (showPasswordModal) {
-      fetch("/api/config")
-        .then(res => res.json())
-        .then(data => {
-          if (data && data.adminPassword) {
-            setServerPassword(data.adminPassword);
-          }
-        })
-        .catch(err => console.error("Failed to fetch password configuration", err));
-    }
-  }, [showPasswordModal]);
 
   const handleTeacherAccess = () => {
     if (currentMode === "teacher") {
       onChangeMode("student");
     } else {
-      setShowPasswordModal(true);
-      setError("");
-      setPassword("");
+      const activeCode = localStorage.getItem("teacher_class_code");
+      if (activeCode) {
+        onChangeMode("teacher");
+      } else {
+        setShowPasswordModal(true);
+        setError("");
+        setPassword("");
+        setClassCodeInput("");
+      }
     }
   };
 
-  const handlePasswordSubmit = (e: React.FormEvent) => {
+  const handlePasswordSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (password === serverPassword) {
-      setShowPasswordModal(false);
-      onChangeMode("teacher");
-    } else {
-      setError("비밀번호가 올바르지 않습니다.");
+    if (!classCodeInput.trim()) {
+      setError("학급 코드를 입력해주세요.");
+      return;
+    }
+    if (!password.trim()) {
+      setError("비밀번호를 입력해주세요.");
+      return;
+    }
+
+    try {
+      const res = await fetch("/api/classes/auth", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          classCode: classCodeInput.trim().toLowerCase(),
+          password: password.trim()
+        })
+      });
+
+      const data = await res.json();
+      if (res.ok && data.success) {
+        localStorage.setItem("teacher_class_code", classCodeInput.trim().toLowerCase());
+        setShowPasswordModal(false);
+        onChangeMode("teacher");
+      } else {
+        setError(data.message || "비밀번호가 일치하지 않습니다.");
+      }
+    } catch (err) {
+      console.error("Auth error", err);
+      setError("서버와의 연결에 실패했습니다.");
     }
   };
+
+  const activeClassCode = localStorage.getItem("teacher_class_code");
 
   return (
     <header className="bg-white border-b border-slate-200 sticky top-0 z-40" id="header-container">
@@ -77,31 +97,51 @@ export default function Header({ currentMode, onChangeMode }: HeaderProps) {
             </>
           )}
           <li className="text-slate-300 pointer-events-none" id="nav-divider">|</li>
-          <li className="text-slate-400 text-xs font-normal" id="nav-item-teacher-info">지도교사용 모드</li>
+          <li className="text-slate-400 text-xs font-normal" id="nav-item-teacher-info">
+            {activeClassCode ? (
+              <span>학급: <strong className="text-indigo-600 font-bold uppercase">{activeClassCode}</strong></span>
+            ) : (
+              <span>지도교사용 모드</span>
+            )}
+          </li>
         </ul>
 
         {/* Action Button */}
-        <button
-          onClick={handleTeacherAccess}
-          className={`flex items-center space-x-2 px-4 py-2 rounded-xl text-sm font-semibold transition-all duration-300 shadow-sm ${
-            currentMode === "teacher"
-              ? "bg-indigo-50 text-indigo-700 hover:bg-indigo-100 border border-indigo-200"
-              : "bg-slate-100 text-slate-600 hover:bg-slate-200 border border-slate-200"
-          }`}
-          id="mode-toggle-button"
-        >
-          {currentMode === "teacher" ? (
-            <>
-              <GraduationCap className="w-4 h-4" id="mode-icon-student" />
-              <span>학생 화면으로 가기</span>
-            </>
-          ) : (
-            <>
-              <Shield className="w-4 h-4" id="mode-icon-teacher" />
-              <span>선생님 관리자 모드</span>
-            </>
+        <div className="flex items-center space-x-2" id="header-actions">
+          {currentMode === "teacher" && (
+            <button
+              onClick={() => {
+                localStorage.removeItem("teacher_class_code");
+                onChangeMode("student");
+              }}
+              className="px-3.5 py-2 bg-rose-50 text-rose-600 hover:bg-rose-100 border border-rose-200 rounded-xl text-xs font-bold transition-all shadow-sm"
+              id="class-logout-button"
+            >
+              학급 로그아웃
+            </button>
           )}
-        </button>
+          <button
+            onClick={handleTeacherAccess}
+            className={`flex items-center space-x-2 px-4 py-2 rounded-xl text-sm font-semibold transition-all duration-300 shadow-sm ${
+              currentMode === "teacher"
+                ? "bg-indigo-50 text-indigo-700 hover:bg-indigo-100 border border-indigo-200"
+                : "bg-slate-100 text-slate-600 hover:bg-slate-200 border border-slate-200"
+            }`}
+            id="mode-toggle-button"
+          >
+            {currentMode === "teacher" ? (
+              <>
+                <GraduationCap className="w-4 h-4" id="mode-icon-student" />
+                <span>학생 화면으로 가기</span>
+              </>
+            ) : (
+              <>
+                <Shield className="w-4 h-4" id="mode-icon-teacher" />
+                <span>선생님 관리자 모드</span>
+              </>
+            )}
+          </button>
+        </div>
       </div>
 
       {/* Password modal */}
@@ -113,34 +153,48 @@ export default function Header({ currentMode, onChangeMode }: HeaderProps) {
                 <LayoutDashboard className="w-6 h-6" id="password-icon" />
               </div>
               <div>
-                <h3 className="text-lg font-bold text-gray-800" id="password-title">교사용 관리자 인증</h3>
+                <h3 className="text-lg font-bold text-gray-800" id="password-title">교사 수합대시보드 로그인</h3>
                 <p className="text-xs text-gray-500 mt-1" id="password-desc">
-                  학생들이 제출한 설문 수합 결과를 확인하기 위해 선생님 인증 비밀번호를 입력해주세요.
+                  선생님 고유의 학급 코드를 개설하거나 기존 대시보드로 로그인할 수 있습니다.
                 </p>
-                <p className="text-[11px] text-indigo-500 bg-indigo-50/50 px-2 py-0.5 rounded mt-2 inline-block" id="password-hint">
-                  {serverPassword === "1234" ? (
-                    <>기본 비밀번호: <strong className="font-bold">1234</strong></>
-                  ) : (
-                    <span>설정하신 전용 비밀번호를 입력해주세요.</span>
-                  )}
+                <p className="text-[10px] text-indigo-500 bg-indigo-50/50 px-2.5 py-1 rounded-lg mt-2 inline-block leading-relaxed" id="password-hint">
+                  개설된 적 없는 새로운 학급 코드를 입력하시면<br/>
+                  입력하신 비밀번호로 <strong className="font-bold">신규 대시보드가 자동 생성</strong>됩니다!
                 </p>
               </div>
 
-              <form onSubmit={handlePasswordSubmit} className="w-full space-y-3" id="password-form">
-                <input
-                  type="password"
-                  placeholder="비밀번호 입력"
-                  value={password}
-                  onChange={(e) => {
-                    setPassword(e.target.value);
-                    setError("");
-                  }}
-                  className="w-full px-4 py-3 rounded-xl border border-gray-200 text-center text-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent tracking-widest font-mono"
-                  autoFocus
-                  id="password-input"
-                />
+              <form onSubmit={handlePasswordSubmit} className="w-full space-y-3.5" id="password-form">
+                <div className="space-y-1.5 text-left">
+                  <label className="text-[11px] font-bold text-slate-500 ml-1">학급 코드 (선생님 고유 코드)</label>
+                  <input
+                    type="text"
+                    placeholder="예) seoul301 (영문/숫자)"
+                    value={classCodeInput}
+                    onChange={(e) => setClassCodeInput(e.target.value)}
+                    className="w-full px-4 py-2.5 rounded-xl border border-gray-200 text-center text-base focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent uppercase font-semibold"
+                    required
+                    id="class-code-login-input"
+                  />
+                </div>
+
+                <div className="space-y-1.5 text-left">
+                  <label className="text-[11px] font-bold text-slate-500 ml-1">비밀번호</label>
+                  <input
+                    type="password"
+                    placeholder="비밀번호를 입력해주세요"
+                    value={password}
+                    onChange={(e) => {
+                      setPassword(e.target.value);
+                      setError("");
+                    }}
+                    className="w-full px-4 py-2.5 rounded-xl border border-gray-200 text-center text-base focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent tracking-widest font-mono"
+                    required
+                    id="password-input"
+                  />
+                </div>
+
                 {error && (
-                  <p className="text-xs text-red-500 font-medium animate-pulse" id="password-error">
+                  <p className="text-xs text-rose-500 font-semibold animate-pulse" id="password-error">
                     {error}
                   </p>
                 )}
@@ -158,7 +212,7 @@ export default function Header({ currentMode, onChangeMode }: HeaderProps) {
                     className="flex-1 py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-semibold shadow-md shadow-indigo-100 transition"
                     id="password-confirm"
                   >
-                    확인
+                    접속하기
                   </button>
                 </div>
               </form>
