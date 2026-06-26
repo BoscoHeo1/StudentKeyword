@@ -439,7 +439,7 @@ export default function StudentSurvey({ onSurveySubmitted }: StudentSurveyProps)
                             <motion.span
                               key={k.id}
                               initial={{ scale: 0.6, y: -20, opacity: 0 }}
-                              animate={{ scale: 1, y: 0, opacity: 1, rotate: index % 2 === 0 ? [1, -1, 1] : [-1, 1, -1] }}
+                              animate={{ scale: 1, y: 0, opacity: 1, rotate: index % 2 === 0 ? 1.5 : -1.5 }}
                               transition={{ type: "spring", stiffness: 120, damping: 10 }}
                               whileHover={{ scale: 1.05, rotate: 0 }}
                               className={`text-xs font-black px-3.5 py-2 rounded-2xl border flex items-center space-x-2 select-none cursor-pointer hover:shadow-md transition-shadow ${badgeBg}`}

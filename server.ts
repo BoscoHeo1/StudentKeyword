@@ -750,7 +750,7 @@ app.post("/api/submissions", async (req, res) => {
 `;
 
       const response = await activeAi.models.generateContent({
-        model: "gemini-3.5-flash",
+        model: "gemini-2.5-flash",
         contents: prompt,
         config: {
           responseMimeType: "application/json"
@@ -840,7 +840,7 @@ app.post("/api/submissions/:id/regenerate-ai", async (req, res) => {
 `;
 
     const response = await activeAi.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-2.5-flash",
       contents: prompt,
       config: {
         responseMimeType: "application/json"
