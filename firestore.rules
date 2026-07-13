@@ -1,0 +1,30 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // 1. submissions 컬렉션에 대해서만 안전하게 쓰기 규칙을 지정하고 필드 검증을 거칩니다.
+    match /submissions/{submissionId} {
+      // 읽기 허용 (클래스 코드별 조회를 위한 최소 권한)
+      allow read: if true;
+      
+      // 데이터 생성 및 수정 시, 정해진 스키마(필수 필드 및 타입)를 엄격하게 검증하여 악성 데이터 주입을 차단합니다.
+      allow create, update: if request.resource.data.keys().hasAll([
+        'grade', 'classNumber', 'studentNumber', 'name', 'keywords', 'timestamp', 'aiFeedback', 'reportCardDraft'
+      ])
+      && request.resource.data.grade is string
+      && request.resource.data.classNumber is string
+      && request.resource.data.studentNumber is string
+      && request.resource.data.name is string
+      && request.resource.data.keywords is list
+      && request.resource.data.timestamp is string;
+      
+      // 삭제 허용 (서버가 관리자 모드 등에서 삭제 요청할 때 사용)
+      allow delete: if true;
+    }
+
+    // 2. 이외의 임의의 모든 컬렉션과 하위 디렉토리에 대해서는 외부의 직접적인 직접 읽기/쓰기를 완벽히 차단합니다.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
