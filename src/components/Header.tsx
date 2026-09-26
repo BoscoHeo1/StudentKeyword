@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { Shield, GraduationCap, LayoutDashboard } from "lucide-react";
 
 interface HeaderProps {
@@ -12,20 +12,70 @@ export default function Header({ currentMode, onChangeMode }: HeaderProps) {
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
 
-  const handleTeacherAccess = () => {
-    if (currentMode === "teacher") {
-      onChangeMode("student");
-    } else {
-      const activeCode = localStorage.getItem("teacher_class_code");
-      if (activeCode) {
+  const [activeClassCode, setActiveClassCode] = useState<string | null>(null);
+
+  const requestLogin = () => {
+    localStorage.removeItem("teacher_class_code");
+    setActiveClassCode(null);
+    onChangeMode("student");
+    setShowPasswordModal(true);
+    setPassword("");
+    setError("");
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    const check = async () => {
+      try {
+        const res = await fetch("/api/classes/session", { credentials: "same-origin", cache: "no-store" });
+        if (cancelled) return;
+        if (res.ok) {
+          const data = await res.json();
+          if (cancelled) return;
+          setActiveClassCode(data.classCode);
+          localStorage.setItem("teacher_class_code", data.classCode);
+        } else if (res.status === 401) {
+          setActiveClassCode(null);
+          localStorage.removeItem("teacher_class_code");
+          if (currentMode === "teacher") requestLogin();
+        }
+      } catch { /* A network failure must not be treated as authenticated. */ }
+    };
+    check();
+    const reauthenticate = () => requestLogin();
+    window.addEventListener("teacher-session-expired", reauthenticate);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("teacher-session-expired", reauthenticate);
+    };
+  }, [currentMode]);
+
+  const handleTeacherAccess = async () => {
+    if (currentMode === "teacher") { onChangeMode("student"); return; }
+    try {
+      const res = await fetch("/api/classes/session", { credentials: "same-origin", cache: "no-store" });
+      if (res.ok) {
+        const data = await res.json();
+        setActiveClassCode(data.classCode);
+        localStorage.setItem("teacher_class_code", data.classCode);
         onChangeMode("teacher");
-      } else {
-        setShowPasswordModal(true);
-        setError("");
-        setPassword("");
+      } else if (res.status === 401) {
         setClassCodeInput("");
+        requestLogin();
+      } else {
+        alert("인증 정보를 확인할 수 없습니다. 잠시 후 다시 시도해주세요.");
       }
-    }
+    } catch { alert("서버에 연결할 수 없습니다. 잠시 후 다시 시도해주세요."); }
+  };
+
+  const handleLogout = async () => {
+    try {
+      const res = await fetch("/api/classes/logout", { method: "POST", credentials: "same-origin" });
+      if (!res.ok) throw new Error("Logout failed");
+      localStorage.removeItem("teacher_class_code");
+      setActiveClassCode(null);
+      onChangeMode("student");
+    } catch { alert("로그아웃을 완료하지 못했습니다. 다시 시도해주세요."); }
   };
 
   const handlePasswordSubmit = async (e: React.FormEvent) => {
@@ -51,7 +101,9 @@ export default function Header({ currentMode, onChangeMode }: HeaderProps) {
 
       const data = await res.json();
       if (res.ok && data.success) {
-        localStorage.setItem("teacher_class_code", classCodeInput.trim().toLowerCase());
+        localStorage.setItem("teacher_class_code", data.classCode);
+        setActiveClassCode(data.classCode);
+        setPassword("");
         setShowPasswordModal(false);
         onChangeMode("teacher");
       } else {
@@ -63,7 +115,6 @@ export default function Header({ currentMode, onChangeMode }: HeaderProps) {
     }
   };
 
-  const activeClassCode = localStorage.getItem("teacher_class_code");
 
   return (
     <header className="bg-white border-b border-slate-200 sticky top-0 z-40" id="header-container">
@@ -110,10 +161,7 @@ export default function Header({ currentMode, onChangeMode }: HeaderProps) {
         <div className="flex items-center space-x-2" id="header-actions">
           {currentMode === "teacher" && (
             <button
-              onClick={() => {
-                localStorage.removeItem("teacher_class_code");
-                onChangeMode("student");
-              }}
+              onClick={handleLogout}
               className="px-3.5 py-2 bg-rose-50 text-rose-600 hover:bg-rose-100 border border-rose-200 rounded-xl text-xs font-bold transition-all shadow-sm"
               id="class-logout-button"
             >
@@ -223,3 +271,4 @@ export default function Header({ currentMode, onChangeMode }: HeaderProps) {
     </header>
   );
 }
+

@@ -1,146 +1,22 @@
 import express from "express";
 import path from "path";
-import fs from "fs";
+import { randomUUID } from "node:crypto";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import { StudentSubmission } from "./src/types";
-import pg from "pg";
-import { initializeApp } from "firebase/app";
-import { 
-  getFirestore, 
-  collection, 
-  getDocs, 
-  doc, 
-  setDoc, 
-  getDoc,
-  deleteDoc, 
-  query, 
-  orderBy,
-  writeBatch
-} from "firebase/firestore";
+import { createPasswordHash, verifyClassPassword } from "./server/password";
+import { assertTeacherAuthConfigured, issueTeacherCookie, clearTeacherCookie, readTeacherSession, requireTeacherOrigin, teacherRateLimit } from "./server/teacher-auth";
+import { getServerFirestore } from "./server/firestore";
+import { FieldValue } from "firebase-admin/firestore";
 
-const { Pool } = pg;
 const app = express();
-const PORT = 3000;
-const SUBMISSIONS_FILE = path.join(process.cwd(), "data", "submissions.json");
-const CONFIG_FILE = path.join(process.cwd(), "data", "config.json");
 
-// Ensure data directory exists
-const dataDir = path.dirname(SUBMISSIONS_FILE);
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true });
+export function resolvePort(value = process.env.PORT): number {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535 ? parsed : 3000;
 }
 
-// PostgreSQL Dynamic Connection Setup (Supabase / Neon Support)
-let dbPool: pg.Pool | null = null;
-const DATABASE_URL = process.env.DATABASE_URL;
-
-if (DATABASE_URL) {
-  console.log("DATABASE_URL found! Connecting to PostgreSQL (Supabase/Neon)...");
-  dbPool = new Pool({
-    connectionString: DATABASE_URL,
-    ssl: { rejectUnauthorized: false } // Required for Supabase/Neon production connections
-  });
-} else {
-  console.log("No DATABASE_URL found. Will check for Firebase Firestore or use local JSON fallback.");
-}
-
-// Firebase Firestore Connection Setup
-let firestoreDb: any = null;
-const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID;
-
-if (FIREBASE_PROJECT_ID) {
-  console.log("FIREBASE_PROJECT_ID found! Connecting to Firebase Firestore...");
-  try {
-    const firebaseConfig = {
-      apiKey: process.env.FIREBASE_API_KEY,
-      authDomain: process.env.FIREBASE_AUTH_DOMAIN,
-      projectId: FIREBASE_PROJECT_ID,
-      storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
-      messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID,
-      appId: process.env.FIREBASE_APP_ID
-    };
-    const firebaseApp = initializeApp(firebaseConfig);
-    firestoreDb = getFirestore(firebaseApp);
-    console.log("Firebase Firestore initialized successfully.");
-  } catch (error) {
-    console.error("Failed to initialize Firebase Firestore:", error);
-  }
-}
-
-// Automated PostgreSQL Schema Migration Helper
-async function initDatabase() {
-  if (!dbPool) return;
-  try {
-    const client = await dbPool.connect();
-    try {
-      // 1. Create submissions table
-      await client.query(`
-        CREATE TABLE IF NOT EXISTS submissions (
-          id VARCHAR(50) PRIMARY KEY,
-          grade VARCHAR(10) NOT NULL,
-          class_number VARCHAR(10) NOT NULL,
-          student_number VARCHAR(10) NOT NULL,
-          name VARCHAR(50) NOT NULL,
-          keywords TEXT[] NOT NULL,
-          timestamp VARCHAR(50) NOT NULL,
-          ai_feedback TEXT NOT NULL,
-          report_card_draft TEXT NOT NULL
-        )
-      `);
-
-      // Add class_code column to submissions if it doesn't exist
-      await client.query(`
-        ALTER TABLE submissions ADD COLUMN IF NOT EXISTS class_code VARCHAR(100) DEFAULT 'default'
-      `);
-      
-      // 2. Create config table
-      await client.query(`
-        CREATE TABLE IF NOT EXISTS config (
-          key VARCHAR(50) PRIMARY KEY,
-          value TEXT NOT NULL
-        )
-      `);
-
-      // 3. Create classes table
-      await client.query(`
-        CREATE TABLE IF NOT EXISTS classes (
-          class_code VARCHAR(100) PRIMARY KEY,
-          password VARCHAR(100) NOT NULL,
-          created_at VARCHAR(100) NOT NULL
-        )
-      `);
-      console.log("PostgreSQL database schemas verified successfully.");
-    } finally {
-      client.release();
-    }
-  } catch (error) {
-    console.error("Failed to initialize PostgreSQL database, falling back to JSON:", error);
-    dbPool = null; // Fallback to local files if database is offline or misconfigured
-  }
-}
-
-// Config helper functions
-function getConfig() {
-  try {
-    if (fs.existsSync(CONFIG_FILE)) {
-      const content = fs.readFileSync(CONFIG_FILE, "utf-8");
-      return JSON.parse(content);
-    }
-  } catch (error) {
-    console.error("Failed to read config file, using default", error);
-  }
-  return { adminPassword: "1234" };
-}
-
-function saveConfig(config: { adminPassword: string }) {
-  try {
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), "utf-8");
-  } catch (error) {
-    console.error("Failed to write config file", error);
-  }
-}
-
+const PORT = resolvePort();
 
 // Korean name friendly calling helper
 function getFriendlyName(name: string): string {
@@ -251,46 +127,121 @@ function postProcessDraft(draft: string): string {
   return sentences.filter(Boolean).join(" ");
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 // Post-process student feedback to use friendly vocative
+
+
+function buildTeacherFeedbackPrompt(input: {
+  name: string;
+  grade: string;
+  classNumber: string;
+  studentNumber?: string;
+  keywords: string[];
+}): string {
+  const studentNumber = input.studentNumber ? ` ${input.studentNumber}번` : "";
+  return `
+당신은 학생을 잘 이해하고 따뜻하게 격려하는 담임 선생님입니다.
+학생이 직접 선택한 5개의 키워드를 바탕으로 학생 피드백과 생활기록부 추천 초안을 작성하세요.
+
+[학생 정보]
+이름: ${input.name} (${input.grade}학년 ${input.classNumber}반${studentNumber})
+선택한 키워드: [${input.keywords.join(", ")}]
+
+[출력 형식]
+마크다운 없이 아래 구조의 순수 JSON만 반환하세요.
+{
+  "aiFeedback": "학생 피드백",
+  "reportCardDraft": "생활기록부 초안"
+}
+
+[학생 피드백 규칙]
+1. 실제 담임 선생님이 학생에게 직접 이야기하듯 자연스럽고 따뜻하게 작성하세요.
+2. 5개 키워드를 나열하지 말고 서로 연결해 학생의 강점과 앞으로의 가능성을 3~5문장으로 설명하세요.
+3. 초등학생이 쉽게 이해할 수 있는 말투를 사용하고, 과장된 칭찬·오글거리는 표현·광고 문구·반복 칭찬을 피하세요.
+4. 'AI', '인공지능', '마술사', '분석가', '데이터', '알고리즘'이라는 표현을 사용하지 마세요.
+5. 학생 이름은 전체에서 최대 1회만, 호칭 없이 입력된 이름 그대로 사용하세요. 이름 뒤에 '아'나 '야'를 붙이지 마세요.
+6. '민수아아', '민수야야', '민수야아'처럼 이름이나 호칭이 반복되는 표현을 만들지 마세요.
+
+[이름과 말투 추가 규칙]
+- 이름은 필요할 때만 최대 한 번 사용하고, 생략해도 됩니다. 이름이 없는 문장에 이름을 새로 넣지 마세요.
+- 이름 뒤에 조사를 쓸 때는 받침에 맞는 조사 하나만 붙이고 반복하지 마세요. '민수는 는'처럼 조사 중복을 만들지 마세요.
+- 이름 뒤에 '아'나 '야'를 붙이지 마세요.
+- '우리 반의 자랑'처럼 지나치게 치켜세우거나 미래를 단정하지 말고, 키워드와 연결되는 구체적인 모습과 현실적인 가능성을 말하세요.
+[생활기록부 추천 초안 규칙]
+1. 모든 문장은 마침표를 포함해 '~함.' 또는 '~임.'으로 끝내세요.
+2. 줄바꿈 없이 한 문단으로 작성하세요.
+3. 영문과 수학 기호를 피하고, 키워드를 그대로 나열하지 말고 의미를 자연스럽게 녹이세요.
+4. 공백 포함 약 150~220자로 작성하세요.
+`;
+}
+
 function postProcessFeedback(feedback: string, name: string): string {
   if (!feedback) return "";
-  let cleaned = feedback.trim();
-  
-  const friendlyName = getFriendlyName(name);
-  
-  // Replace generic names and titles
-  cleaned = cleaned.replace(new RegExp(`${name}\\s*(어린이|친구|학생)?`, "g"), friendlyName);
-  cleaned = cleaned.replace(new RegExp(`${name.substring(1)}\\s*(어린이|친구|학생)?`, "g"), friendlyName);
-  cleaned = cleaned.replace(/어린이/g, "친구");
-  
-  // Ensure the feedback starts with the friendly name
-  if (!cleaned.startsWith(friendlyName)) {
-    cleaned = cleaned.replace(/^[^a-zA-Z0-9가-힣]+/, "");
-    cleaned = `${friendlyName}! ${cleaned}`;
+  const fullName = name.trim();
+  let cleaned = feedback
+    .replace(/AI|인공지능|마술사|분석가|데이터|알고리즘/gi, "")
+    .replace(/[\r\n]+/g, " ")
+    .trim();
+  if (fullName) {
+    const escapedName = fullName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const particles = "은|는|이|가|을|를|와|과";
+    cleaned = cleaned
+      .replace(
+        new RegExp("(" + escapedName + ")(" + particles + ")\\s*(?:" + particles + ")(?=\\s|[,.!?]|$)", "g"),
+        "$1$2"
+      )
+      .replace(
+        new RegExp("(" + escapedName + ")(?:아아|야야|야아|아야|아|야)(?:\\s*(?:어린이|친구|학생))?(?=\\s|[,.!?]|$)", "g"),
+        "$1"
+      );
+    const lastCode = fullName.charCodeAt(fullName.length - 1);
+    const isHangulSyllable = lastCode >= 0xac00 && lastCode <= 0xd7a3;
+    if (isHangulSyllable) {
+      const hasFinalConsonant = (lastCode - 0xac00) % 28 !== 0;
+      const particleCorrections: Record<string, string> = hasFinalConsonant
+        ? { 는: "은", 가: "이", 를: "을", 와: "과" }
+        : { 은: "는", 이: "가", 을: "를", 과: "와" };
+      const incorrectParticles = Object.keys(particleCorrections).join("|");
+      cleaned = cleaned.replace(
+        new RegExp("(" + escapedName + ")(" + incorrectParticles + ")(?=\\s|[,.!?]|$)", "g"),
+        (_match, matchedName, particle: string) => matchedName + particleCorrections[particle]
+      );
+    }
   }
-  
+
+  cleaned = cleaned
+    .replace(/^[\s!,.]+/, "")
+    .replace(/\s+([,.!?])/g, "$1")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  const sentences = cleaned.split(/(?<=[.!?])\s+/).filter(Boolean).slice(0, 5);
+  cleaned = sentences.join(" ");
   return cleaned;
 }
 
+
 // Rule-based high-quality fallback generator
+
 function generateFallbackText(name: string, keywords: string[]): { aiFeedback: string; reportCardDraft: string } {
-  const friendlyName = getFriendlyName(name);
-  const k1 = keywords[0] || "따뜻한 배려";
-  const k2 = keywords[1] || "성실함";
-  const k3 = keywords[2] || "책임감";
-  const k4 = keywords[3] || "자기주도성";
-  const k5 = keywords[4] || "원만한 관계";
-
-  const aiFeedback = `${friendlyName}! 직접 고른 아름다운 키워드인 '${k1}', '${k2}', '${k3}'처럼 스스로에 대한 깊은 가치와 재능을 믿고 성실히 나아가는 모습이 정말 대견하고 기특해. 늘 밝고 예쁜 웃음과 함께 너의 큰 꿈을 멋지게 이루어 나가길 온 마음 다해 응원할게!`;
-
-  const s1 = `학급 공동체 속에서 주변 동료들을 배려하고 이해하려는 마음가짐으로 타인과 조화롭게 소통함.`;
-  const s2 = `자신이 선택한 가치들을 마음속에 품고서 매 학급 활동마다 성실하고 끈기 있게 참여하는 학습 태도가 돋보임.`;
-  const s3 = `주어진 과제를 스스로 계획하여 끝까지 완수해내는 훌륭한 자기주도성과 책임감 있는 성향을 지님.`;
-  const s4 = `풍부한 공감 능력을 바탕으로 교우들의 생각에 귀를 기울이며 긍정적인 사회성과 성장의 잠재력을 두루 갖춘 모범적인 학생임.`;
-
-  const reportCardDraft = `${s1} ${s2} ${s3} ${s4}`;
+  const [k1 = "따뜻한 배려", k2 = "성실함", k3 = "책임감", k4 = "자기주도성", k5 = "원만한 관계"] = keywords;
+  const aiFeedback = [
+    "네가 고른 ‘" + k1 + "’, ‘" + k2 + "’ 두 가지를 함께 살펴보면, 다른 사람을 생각하고 맡은 일을 꾸준히 해내려는 모습이 보여.",
+    "‘" + k3 + "’의 의미에서는 맡은 일을 책임 있게 마무리하려는 태도가, ‘" + k4 + "’의 의미에서는 스스로 생각해 실천하려는 모습이 느껴져.",
+    "마지막으로 고른 ‘" + k5 + "’도 친구들과 생각을 나누고 함께 지내는 데 도움이 될 수 있어.",
+    "지금 가진 강점을 생활 속에서 차근차근 이어 가면 좋겠어."
+  ].join(" ");
+  const reportCardDraft = [
+    "학급 공동체 속에서 주변 동료들을 배려하고 이해하려는 마음가짐으로 타인과 조화롭게 소통함.",
+    "자신이 선택한 가치들을 마음속에 품고서 매 학급 활동마다 성실하고 끈기 있게 참여하는 학습 태도가 돋보임.",
+    "주어진 과제를 스스로 계획하여 끝까지 완수해내는 훌륭한 자기주도성과 책임감 있는 성향을 지님.",
+    "풍부한 공감 능력을 바탕으로 교우들의 생각에 귀를 기울이며 긍정적인 사회성과 성장의 잠재력을 두루 갖춘 학생임.",
+  ].join(" ");
   return { aiFeedback, reportCardDraft };
 }
+
 
 // Initialize dynamic Gemini Client resolver
 function getGeminiClient(customKey?: string): GoogleGenAI | null {
@@ -311,294 +262,80 @@ function getGeminiClient(customKey?: string): GoogleGenAI | null {
   }
 }
 
-// In-memory or file-backed database helper
-function getSubmissions(): StudentSubmission[] {
-  try {
-    if (fs.existsSync(SUBMISSIONS_FILE)) {
-      const content = fs.readFileSync(SUBMISSIONS_FILE, "utf-8");
-      return JSON.parse(content);
-    } else {
-      // Seed default sample data so the dashboard is immediately interactive and clear
-      const defaultSamples: StudentSubmission[] = [
-        {
-          id: "seed-1",
-          grade: "3",
-          classNumber: "1",
-          studentNumber: "05",
-          name: "김민준",
-          keywords: ["원만한 교우관계", "친구들의 의견 존중", "정직하고 올바른 태도", "늘 미소짓는 모습", "선생님 말씀 경청"],
-          timestamp: new Date(Date.now() - 3600000 * 2).toISOString(), // 2 hours ago
-          aiFeedback: "민준아! 친구들을 아끼고 존중하며 바르게 행동하는 모습이 정말 멋져요. 앞으로도 늘 밝은 미소와 따뜻한 마음으로 친구들과 함께 성장하는 멋진 어린이가 되길 응원할게요!",
-          reportCardDraft: "공동체 활동 시 타인의 의견을 존중하고 경청하는 태도로 원만한 교우관계를 유지함. 매사 정직하고 올바른 마음가짐으로 학급 규칙을 준수하며 수업 시간 내내 선생님의 설명을 주의 깊게 경청하고 늘 밝은 미소로 학습에 성실히 임함."
-        },
-        {
-          id: "seed-2",
-          grade: "3",
-          classNumber: "1",
-          studentNumber: "12",
-          name: "이서연",
-          keywords: ["따뜻한 봉사정신", "책임감 있는 성품", "학습 이해력 우수", "자기주도적 학습태도", "정독과 속독의 조화"],
-          timestamp: new Date(Date.now() - 3600000 * 1.5).toISOString(), // 1.5 hours ago
-          aiFeedback: "서연아! 보이지 않는 곳에서도 남을 돕는 따뜻한 마음과 스스로 계획을 세워 공부하는 현명함이 조화를 이루네요. 멋진 꿈을 향해 나아가는 빛나는 서연이가 되세요!",
-          reportCardDraft: "이타심과 봉사정신이 돋보여 자발적으로 주변을 배려하고 돕는 태도가 우수함. 맡은 바 일에 최선을 다하는 책임감 있는 성품을 지녔으며 뛰어난 학습 이해력을 바탕으로 늘 자기주도적인 자세로 공부에 열중함. 정독과 속독을 능숙하게 조화시키며 책을 깊이 있게 읽는 훌륭한 독서 습관을 생활화함."
-        },
-        {
-          id: "seed-3",
-          grade: "3",
-          classNumber: "2",
-          studentNumber: "03",
-          name: "박예준",
-          keywords: ["밝은 에너지", "유쾌한 유머감각", "끈기있고 도전적임", "수업 집중도가 높음", "논리적인 글쓰기"],
-          timestamp: new Date(Date.now() - 3600000 * 1).toISOString(), // 1 hour ago
-          aiFeedback: "예준아! 실패를 두려워하지 않는 끈기 있는 태도와 수업 시간에 뿜어져 나오는 고도의 집중력이 대단해요! 유쾌하고 밝은 웃음과 훌륭한 글쓰기 솜씨로 친구들과 기쁨을 더 나누어봐요!",
-          reportCardDraft: "학급에 밝고 활기찬 에너지를 불어넣는 쾌활한 성격으로 유쾌한 유머감각을 발휘하여 교우관계가 원만함. 어려움에 직면해도 포기하지 않고 끝까지 성실하게 도전하는 끈기를 보이며 수업 시간의 집중도가 대단히 높음. 본인의 생각을 명확하고 짜임새 있게 표현하는 논리적인 글쓰기 능력이 뛰어남."
-        },
-        {
-          id: "seed-4",
-          grade: "3",
-          classNumber: "2",
-          studentNumber: "18",
-          name: "최지우",
-          keywords: ["뛰어난 의사소통 능력", "학급 규칙 준수", "끝까지 노력하는 자세", "질문과 답변 활동 우수", "효율적인 시간관리"],
-          timestamp: new Date(Date.now() - 300000 * 4).toISOString(), // 20 mins ago
-          aiFeedback: "지우야! 친구들의 이야기에 귀를 기울이고 똑부러지게 의견을 전하는 소통의 달인이군요! 무엇이든 끝까지 해내려는 끈기와 야무진 시간 관리 능력을 발휘해 매일 더 멋지게 자라나길 바랄게요!",
-          reportCardDraft: "타인의 처지를 이해하며 본인의 생각을 명확히 표현하는 뛰어난 의사소통 능력을 갖추고 있음. 학급 내 규칙을 엄격히 준수하며 공정하게 생활하고 한 번 시작한 과제는 끝까지 완수하는 책임감 있는 노력이 돋보임. 수업 시간 중 적극적인 질문과 모범적인 답변 활동을 행하며 정해진 시간을 효율적으로 배분하여 자기관리를 실천함."
-        }
-      ];
-      saveSubmissions(defaultSamples);
-      return defaultSamples;
-    }
-  } catch (error) {
-    console.error("Failed to read submissions file, using empty array", error);
-  }
-  return [];
+// Firestore-only persistence; no local seeding or alternate-store fallback.
+function submissionForTeacher(data: any, id: string): StudentSubmission {
+  return {
+    id, grade: data.grade || "", classNumber: data.classNumber || "",
+    studentNumber: data.studentNumber || "", name: data.name || "",
+    keywords: data.keywords || [], timestamp: data.timestamp || "",
+    aiFeedback: data.aiFeedback || "", reportCardDraft: data.reportCardDraft || "",
+    classCode: data.classCode
+  };
 }
 
-function saveSubmissions(submissions: StudentSubmission[]): void {
-  try {
-    fs.writeFileSync(SUBMISSIONS_FILE, JSON.stringify(submissions, null, 2), "utf-8");
-  } catch (error) {
-    console.error("Failed to write submissions file", error);
-  }
-}
-
-// ==========================================
-// ASYNC HYBRID DATABASE ACCESS LAYERS
-// ==========================================
-
-async function getSubmissionsAsync(classCode?: string): Promise<StudentSubmission[]> {
-  const targetCode = classCode?.toLowerCase().trim() || "default";
-
-  if (firestoreDb) {
-    try {
-      const submissionsCol = collection(firestoreDb, "submissions");
-      const q = query(submissionsCol);
-      const snapshot = await getDocs(q);
-      const items: StudentSubmission[] = [];
-      snapshot.forEach((docSnap) => {
-        const data = docSnap.data();
-        const subClassCode = data.classCode || "default";
-        if (subClassCode === targetCode) {
-          items.push({
-            id: docSnap.id,
-            grade: data.grade || "",
-            classNumber: data.classNumber || "",
-            studentNumber: data.studentNumber || "",
-            name: data.name || "",
-            keywords: data.keywords || [],
-            timestamp: data.timestamp || "",
-            aiFeedback: data.aiFeedback || "",
-            reportCardDraft: data.reportCardDraft || "",
-            classCode: subClassCode
-          });
-        }
-      });
-      // Sort desc by timestamp
-      items.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
-      return items;
-    } catch (error) {
-      console.error("Failed to query submissions from Firebase Firestore, falling back:", error);
-    }
-  }
-  if (dbPool) {
-    try {
-      const result = await dbPool.query(
-        "SELECT * FROM submissions WHERE class_code = $1 ORDER BY timestamp DESC",
-        [targetCode]
-      );
-      return result.rows.map(row => ({
-        id: row.id,
-        grade: row.grade,
-        classNumber: row.class_number,
-        studentNumber: row.student_number,
-        name: row.name,
-        keywords: row.keywords,
-        timestamp: row.timestamp,
-        aiFeedback: row.ai_feedback,
-        reportCardDraft: row.report_card_draft,
-        classCode: row.class_code
-      }));
-    } catch (error) {
-      console.error("Failed to query submissions from PostgreSQL, falling back to local JSON:", error);
-    }
-  }
-  return getSubmissions().filter(s => (s.classCode || "default") === targetCode);
+async function getSubmissionsAsync(classCode: string): Promise<StudentSubmission[]> {
+  if (!classCode) throw new Error("Class scope required");
+  const snapshot = await getServerFirestore().collection("submissions").where("classCode", "==", classCode).get();
+  const items: StudentSubmission[] = [];
+  snapshot.forEach(snap => {
+    const data = snap.data();
+    if (data.classCode === classCode) items.push(submissionForTeacher(data, snap.id));
+  });
+  return items.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
 }
 
 async function addSubmissionAsync(s: StudentSubmission): Promise<void> {
-  const finalClassCode = s.classCode?.toLowerCase().trim() || "default";
-
-  if (firestoreDb) {
-    try {
-      const docRef = doc(firestoreDb, "submissions", s.id);
-      await setDoc(docRef, {
-        grade: s.grade,
-        classNumber: s.classNumber,
-        studentNumber: s.studentNumber,
-        name: s.name,
-        keywords: s.keywords,
-        timestamp: s.timestamp,
-        aiFeedback: s.aiFeedback,
-        reportCardDraft: s.reportCardDraft,
-        classCode: finalClassCode
-      });
-      console.log(`Successfully added submission for ${s.name} into Firebase Firestore.`);
-      return;
-    } catch (error) {
-      console.error("Failed to insert submission into Firebase Firestore, falling back:", error);
-    }
-  }
-  if (dbPool) {
-    try {
-      await dbPool.query(
-        `INSERT INTO submissions (id, grade, class_number, student_number, name, keywords, timestamp, ai_feedback, report_card_draft, class_code)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-        [s.id, s.grade, s.classNumber, s.studentNumber, s.name, s.keywords, s.timestamp, s.aiFeedback, s.reportCardDraft, finalClassCode]
-      );
-      console.log(`Successfully added submission for ${s.name} into PostgreSQL.`);
-      return;
-    } catch (error) {
-      console.error("Failed to insert submission into PostgreSQL, falling back to local JSON:", error);
-    }
-  }
-  
-  const current = getSubmissions();
-  current.push({ ...s, classCode: finalClassCode });
-  saveSubmissions(current);
+  if (!s.classCode) throw new Error("Class scope required");
+  const db = getServerFirestore();
+  const ref = db.collection("submissions").doc(s.id);
+  // Explicit whitelist. A collision must fail, never overwrite an existing ID.
+  await db.runTransaction(async transaction => {
+    const cls = await transaction.get(db.collection("classes").doc(s.classCode!));
+    if (!cls.exists) throw new Error("Class no longer exists");
+    transaction.create(ref, {
+      grade: s.grade, classNumber: s.classNumber, studentNumber: s.studentNumber,
+      name: s.name, keywords: s.keywords, timestamp: s.timestamp,
+      aiFeedback: s.aiFeedback, reportCardDraft: s.reportCardDraft, classCode: s.classCode
+    });
+  });
 }
 
-async function updateSubmissionAsync(s: StudentSubmission): Promise<void> {
-  const finalClassCode = s.classCode?.toLowerCase().trim() || "default";
-
-  if (firestoreDb) {
-    try {
-      const docRef = doc(firestoreDb, "submissions", s.id);
-      await setDoc(docRef, {
-        grade: s.grade,
-        classNumber: s.classNumber,
-        studentNumber: s.studentNumber,
-        name: s.name,
-        keywords: s.keywords,
-        timestamp: s.timestamp,
-        aiFeedback: s.aiFeedback,
-        reportCardDraft: s.reportCardDraft,
-        classCode: finalClassCode
-      }, { merge: true });
-      console.log(`Successfully updated submission for ${s.name} in Firebase Firestore.`);
-      return;
-    } catch (error) {
-      console.error("Failed to update submission in Firebase Firestore, falling back:", error);
-    }
-  }
-  if (dbPool) {
-    try {
-      await dbPool.query(
-        `UPDATE submissions 
-         SET grade = $2, class_number = $3, student_number = $4, name = $5, keywords = $6, timestamp = $7, ai_feedback = $8, report_card_draft = $9, class_code = $10
-         WHERE id = $1`,
-        [s.id, s.grade, s.classNumber, s.studentNumber, s.name, s.keywords, s.timestamp, s.aiFeedback, s.reportCardDraft, finalClassCode]
-      );
-      console.log(`Successfully updated submission for ${s.name} in PostgreSQL.`);
-      return;
-    } catch (error) {
-      console.error("Failed to update submission in PostgreSQL, falling back to local JSON:", error);
-    }
-  }
-  
-  const submissions = getSubmissions();
-  const subIndex = submissions.findIndex((item) => item.id === s.id);
-  if (subIndex !== -1) {
-    submissions[subIndex] = { ...s, classCode: finalClassCode };
-    saveSubmissions(submissions);
-  }
+async function updateSubmissionAsync(s: StudentSubmission, classCode: string): Promise<void> {
+  if (!classCode || s.classCode !== classCode) throw new Error("Submission access denied");
+  const db = getServerFirestore();
+  const ref = db.collection("submissions").doc(s.id);
+  await db.runTransaction(async transaction => {
+    const current = await transaction.get(ref);
+    if (!current.exists || current.data()!.classCode !== classCode) throw new Error("Submission access denied");
+    transaction.update(ref, { aiFeedback: s.aiFeedback, reportCardDraft: s.reportCardDraft });
+  });
 }
 
-async function deleteSubmissionAsync(id: string): Promise<boolean> {
-  if (firestoreDb) {
-    try {
-      const docRef = doc(firestoreDb, "submissions", id);
-      await deleteDoc(docRef);
-      console.log(`Successfully deleted submission ID ${id} from Firebase Firestore.`);
-      return true;
-    } catch (error) {
-      console.error("Failed to delete submission from Firebase Firestore, falling back:", error);
-    }
-  }
-  if (dbPool) {
-    try {
-      const result = await dbPool.query("DELETE FROM submissions WHERE id = $1", [id]);
-      console.log(`Successfully deleted submission ID ${id} from PostgreSQL.`);
-      return (result.rowCount ?? 0) > 0;
-    } catch (error) {
-      console.error("Failed to delete submission from PostgreSQL, falling back to local JSON:", error);
-    }
-  }
-  
-  const submissions = getSubmissions();
-  const filtered = submissions.filter((s) => s.id !== id);
-  if (submissions.length === filtered.length) {
-    return false;
-  }
-  saveSubmissions(filtered);
-  return true;
+async function deleteSubmissionAsync(id: string, classCode: string): Promise<boolean> {
+  if (!classCode) throw new Error("Class scope required");
+  const db = getServerFirestore();
+  const ref = db.collection("submissions").doc(id);
+  return db.runTransaction(async transaction => {
+    const current = await transaction.get(ref);
+    if (!current.exists || current.data()!.classCode !== classCode) return false;
+    transaction.delete(ref);
+    return true;
+  });
 }
 
 async function resetSubmissionsAsync(classCode: string): Promise<void> {
-  const targetCode = classCode.toLowerCase().trim();
-  if (firestoreDb) {
-    try {
-      const submissionsCol = collection(firestoreDb, "submissions");
-      const snapshot = await getDocs(submissionsCol);
-      const batch = writeBatch(firestoreDb);
-      let count = 0;
-      snapshot.forEach((docSnap) => {
-        const data = docSnap.data();
-        if ((data.classCode || "default") === targetCode) {
-          batch.delete(docSnap.ref);
-          count++;
-        }
+  if (!classCode) throw new Error("Class scope required");
+  const db = getServerFirestore();
+  const snapshot = await db.collection("submissions").where("classCode", "==", classCode).get();
+  for (let i = 0; i < snapshot.docs.length; i += 400) {
+    const batch = snapshot.docs.slice(i, i + 400);
+    await db.runTransaction(async transaction => {
+      const current = await transaction.getAll(...batch.map(item => item.ref));
+      current.forEach(item => {
+        if (item.exists && item.data()!.classCode === classCode) transaction.delete(item.ref);
       });
-      if (count > 0) {
-        await batch.commit();
-      }
-      console.log(`Successfully cleared ${count} submissions for class ${targetCode} in Firebase Firestore.`);
-      return;
-    } catch (error) {
-      console.error("Failed to clear submissions in Firebase Firestore, falling back:", error);
-    }
+    });
   }
-  if (dbPool) {
-    try {
-      await dbPool.query("DELETE FROM submissions WHERE class_code = $1", [targetCode]);
-      console.log(`Successfully cleared submissions for class ${targetCode} in PostgreSQL.`);
-      return;
-    } catch (error) {
-      console.error("Failed to clear submissions in PostgreSQL, falling back to local JSON:", error);
-    }
-  }
-  const current = getSubmissions();
-  const remaining = current.filter(s => (s.classCode || "default") !== targetCode);
-  saveSubmissions(remaining);
 }
 
 // ==========================================
@@ -607,170 +344,46 @@ async function resetSubmissionsAsync(classCode: string): Promise<void> {
 
 interface ClassConfig {
   classCode: string;
-  password: string;
+  password?: string;
+  passwordHash?: string;
+  passwordVersion?: number;
+  authVersion?: number;
+  passwordMigratedAt?: string;
   createdAt: string;
-}
-
-function getLocalClasses(): Record<string, ClassConfig> {
-  try {
-    const CLASSES_FILE = path.join(process.cwd(), "data", "classes.json");
-    if (fs.existsSync(CLASSES_FILE)) {
-      return JSON.parse(fs.readFileSync(CLASSES_FILE, "utf-8"));
-    }
-  } catch (e) {
-    console.error("Error reading classes file:", e);
-  }
-  return {};
-}
-
-function saveLocalClasses(classes: Record<string, ClassConfig>) {
-  try {
-    const CLASSES_FILE = path.join(process.cwd(), "data", "classes.json");
-    fs.writeFileSync(CLASSES_FILE, JSON.stringify(classes, null, 2), "utf-8");
-  } catch (e) {
-    console.error("Error writing classes file:", e);
-  }
 }
 
 async function getClassAsync(classCode: string): Promise<ClassConfig | null> {
   const targetCode = classCode.toLowerCase().trim();
-  if (firestoreDb) {
-    try {
-      const docRef = doc(firestoreDb, "classes", targetCode);
-      const docSnap = await getDoc(docRef);
-      if (docSnap.exists()) {
-        const data = docSnap.data();
-        return {
-          classCode: docSnap.id,
-          password: data.password || "",
-          createdAt: data.createdAt || ""
-        };
-      }
-    } catch (error) {
-      console.error("Failed to get class from Firebase Firestore:", error);
-    }
-  }
-  if (dbPool) {
-    try {
-      const result = await dbPool.query("SELECT * FROM classes WHERE class_code = $1", [targetCode]);
-      if (result.rows.length > 0) {
-        return {
-          classCode: result.rows[0].class_code,
-          password: result.rows[0].password,
-          createdAt: result.rows[0].created_at
-        };
-      }
-    } catch (error) {
-      console.error("Failed to get class from PostgreSQL:", error);
-    }
-  }
-  
-  const local = getLocalClasses();
-  return local[targetCode] || null;
+  const snapshot = await getServerFirestore().collection("classes").doc(targetCode).get();
+  if (!snapshot.exists) return null;
+  return { ...snapshot.data(), classCode: snapshot.id } as ClassConfig;
 }
 
-async function saveClassAsync(classCode: string, password: string): Promise<void> {
+async function saveClassAsync(classCode: string, password: string, createOnly = false, expected?: ClassConfig): Promise<ClassConfig> {
   const targetCode = classCode.toLowerCase().trim();
-  const pass = password.trim();
+  const db = getServerFirestore();
+  const passwordHash = await createPasswordHash(password);
   const now = new Date().toISOString();
-
-  if (firestoreDb) {
-    try {
-      const docRef = doc(firestoreDb, "classes", targetCode);
-      await setDoc(docRef, {
-        password: pass,
-        createdAt: now
-      }, { merge: true });
-      console.log(`Successfully saved class ${targetCode} in Firebase Firestore.`);
-      return;
-    } catch (error) {
-      console.error("Failed to save class in Firebase Firestore, falling back:", error);
+  const ref = db.collection("classes").doc(targetCode);
+  return db.runTransaction(async transaction => {
+    const snapshot = await transaction.get(ref);
+    if (createOnly && snapshot.exists) throw new Error("Class already exists. Please log in again.");
+    const previous = snapshot.data() || {};
+    if (expected && (!snapshot.exists || (previous.authVersion ?? 0) !== (expected.authVersion ?? 0)
+      || previous.passwordHash !== expected.passwordHash || previous.password !== expected.password)) {
+      throw new Error("Class credentials changed. Please log in again.");
     }
-  }
-  if (dbPool) {
-    try {
-      await dbPool.query(
-        "INSERT INTO classes (class_code, password, created_at) VALUES ($1, $2, $3) ON CONFLICT (class_code) DO UPDATE SET password = $2",
-        [targetCode, pass, now]
-      );
-      console.log(`Successfully saved class ${targetCode} in PostgreSQL.`);
-      return;
-    } catch (error) {
-      console.error("Failed to save class in PostgreSQL, falling back to local JSON:", error);
-    }
-  }
-  
-  const local = getLocalClasses();
-  local[targetCode] = {
-    classCode: targetCode,
-    password: pass,
-    createdAt: now
-  };
-  saveLocalClasses(local);
+    const saved = {
+      passwordHash, passwordVersion: 1, authVersion: (previous.authVersion ?? 0) + 1,
+      createdAt: previous.createdAt ?? now
+    };
+    if (createOnly) transaction.create(ref, saved);
+    else transaction.set(ref, expected ? { ...saved, password: FieldValue.delete() } : saved, { merge: true });
+    return { ...saved, classCode: targetCode };
+  });
 }
 
-async function getConfigAsync(): Promise<{ adminPassword: string }> {
-  if (firestoreDb) {
-    try {
-      const docRef = doc(firestoreDb, "config", "adminPassword");
-      const docSnap = await getDoc(docRef);
-      if (docSnap.exists()) {
-        return { adminPassword: docSnap.data().value || "1234" };
-      } else {
-        const localConfig = getConfig();
-        await setDoc(docRef, { value: localConfig.adminPassword });
-        return localConfig;
-      }
-    } catch (error) {
-      console.error("Failed to query config from Firebase Firestore, falling back:", error);
-    }
-  }
-  if (dbPool) {
-    try {
-      const result = await dbPool.query("SELECT value FROM config WHERE key = 'adminPassword'");
-      if (result.rows.length > 0) {
-        return { adminPassword: result.rows[0].value };
-      } else {
-        const localConfig = getConfig();
-        await dbPool.query(
-          "INSERT INTO config (key, value) VALUES ('adminPassword', $1) ON CONFLICT (key) DO UPDATE SET value = $1",
-          [localConfig.adminPassword]
-        );
-        return localConfig;
-      }
-    } catch (error) {
-      console.error("Failed to query config from PostgreSQL, falling back to local JSON:", error);
-    }
-  }
-  return getConfig();
-}
-
-async function saveConfigAsync(config: { adminPassword: string }): Promise<void> {
-  if (firestoreDb) {
-    try {
-      const docRef = doc(firestoreDb, "config", "adminPassword");
-      await setDoc(docRef, { value: config.adminPassword }, { merge: true });
-      console.log("Successfully saved configuration in Firebase Firestore.");
-      return;
-    } catch (error) {
-      console.error("Failed to save config in Firebase Firestore, falling back:", error);
-    }
-  }
-  if (dbPool) {
-    try {
-      await dbPool.query(
-        "INSERT INTO config (key, value) VALUES ('adminPassword', $1) ON CONFLICT (key) DO UPDATE SET value = $1",
-        [config.adminPassword]
-      );
-      console.log("Successfully saved configuration in PostgreSQL.");
-      return;
-    } catch (error) {
-      console.error("Failed to save config in PostgreSQL, falling back to local JSON:", error);
-    }
-  }
-  saveConfig(config);
-}
-
+// config/adminPassword is deliberately not read, generated, or modified.
 
 // Initialize Gemini Client
 let ai: GoogleGenAI | null = null;
@@ -793,6 +406,11 @@ if (process.env.GEMINI_API_KEY) {
 }
 
 app.use(express.json()); // Custom Class Code and Authentication Endpoints
+app.use("/api", (_req, res, next) => {
+  // API responses can contain teacher session and student data; never cache them.
+  res.setHeader("Cache-Control", "no-store");
+  next();
+});
 
 // API: Check if class exists
 app.get("/api/classes/check/:classCode", async (req, res) => {
@@ -801,142 +419,188 @@ app.get("/api/classes/check/:classCode", async (req, res) => {
     res.json({ exists: false });
     return;
   }
-  const cls = await getClassAsync(classCode);
-  res.json({ exists: !!cls });
-});
-
-// API: Authenticate class (Login or Auto-Register)
-app.post("/api/classes/auth", async (req, res) => {
-  const { classCode, password } = req.body;
-  if (!classCode || classCode.trim().length === 0 || !password || password.trim().length === 0) {
-    res.status(400).json({ success: false, message: "학급 코드와 비밀번호를 올바르게 입력해주세요." });
-    return;
-  }
-
-  const trimmedCode = classCode.toLowerCase().trim();
-  const trimmedPass = password.trim();
-
   try {
-    const existingClass = await getClassAsync(trimmedCode);
-    if (existingClass) {
-      if (existingClass.password === trimmedPass) {
-        res.json({ success: true, isNew: false, message: "로그인에 성공했습니다." });
-      } else {
-        res.status(401).json({ success: false, message: "비밀번호가 일치하지 않습니다. 다시 입력해주세요." });
-      }
-    } else {
-      await saveClassAsync(trimmedCode, trimmedPass);
-      res.json({ success: true, isNew: true, message: "새로운 학급 대시보드가 성공적으로 개설되었습니다!" });
-    }
+    const cls = await getClassAsync(classCode);
+    res.json({ exists: !!cls });
   } catch (error) {
-    console.error("Auth error:", error);
-    res.status(500).json({ success: false, message: "로그인 처리 중 오류가 발생했습니다." });
+    res.status(503).json({ message: "학급 정보를 확인할 수 없습니다. 잠시 후 다시 시도해주세요." });
   }
 });
 
-// API: Change Class Password
-app.post("/api/classes/change-password", async (req, res) => {
-  const { classCode, oldPassword, newPassword } = req.body;
-  if (!classCode || !oldPassword || !newPassword || newPassword.trim().length === 0) {
-    res.status(400).json({ success: false, message: "모든 입력을 완료해주세요." });
-    return;
-  }
+// Authentication applies to teacher session/password routes only in this phase.
+function teacherConfiguration(_req: express.Request, res: express.Response, next: express.NextFunction) {
+  try { assertTeacherAuthConfigured(); next(); }
+  catch { res.status(503).json({ success: false, message: "교사 인증 설정을 확인해주세요." }); }
+}
 
-  const trimmedCode = classCode.toLowerCase().trim();
+async function requireTeacherSession(req: express.Request, res: express.Response, next: express.NextFunction) {
+  res.setHeader("Cache-Control", "no-store");
   try {
-    const existingClass = await getClassAsync(trimmedCode);
-    if (!existingClass) {
-      res.status(404).json({ success: false, message: "학급을 찾을 수 없습니다." });
-      return;
+    assertTeacherAuthConfigured();
+    const session = readTeacherSession(req);
+    if (!session) {
+      clearTeacherCookie(res);
+      res.status(401).json({ success: false, message: "교사 로그인이 필요합니다." }); return;
     }
-
-    if (existingClass.password !== oldPassword.trim()) {
-      res.status(401).json({ success: false, message: "기존 비밀번호가 일치하지 않습니다." });
-      return;
+    const cls = await getClassAsync(session.classCode);
+    if (!cls || (cls.authVersion ?? 0) !== session.authVersion) {
+      clearTeacherCookie(res);
+      res.status(401).json({ success: false, message: "인증이 만료되었습니다. 다시 로그인해주세요." }); return;
     }
-
-    await saveClassAsync(trimmedCode, newPassword.trim());
-    res.json({ success: true, message: "비밀번호가 성공적으로 변경되었습니다." });
-  } catch (error) {
-    console.error("Password change error:", error);
-    res.status(500).json({ success: false, message: "비밀번호 변경 중 오류가 발생했습니다." });
+    res.locals.teacherClass = cls;
+    next();
+  } catch {
+    res.status(503).json({ success: false, message: "인증 정보를 확인할 수 없습니다. 잠시 후 다시 시도해주세요." });
   }
+}
+
+app.get("/api/classes/session", requireTeacherSession, (_req, res) => {
+  res.json({ success: true, classCode: res.locals.teacherClass.classCode });
 });
 
-// API: Direct update class password (authenticated from browser state)
-app.post("/api/classes/update-password", async (req, res) => {
-  const { classCode, newPassword } = req.body;
-  if (!classCode || !newPassword || newPassword.trim().length === 0) {
-    res.status(400).json({ success: false, message: "학급 코드와 새 비밀번호를 올바르게 입력해주세요." });
-    return;
-  }
-  const trimmedCode = classCode.toLowerCase().trim();
-  try {
-    await saveClassAsync(trimmedCode, newPassword.trim());
-    res.json({ success: true, message: "비밀번호가 성공적으로 변경되었습니다." });
-  } catch (error) {
-    console.error("Update password error:", error);
-    res.status(500).json({ success: false, message: "비밀번호 변경 중 오류가 발생했습니다." });
-  }
-});
-
-// API: Get current config (password) - Keeping for backwards compatibility
-app.get("/api/config", async (req, res) => {
-  const config = await getConfigAsync();
-  res.json(config);
-});
-
-// API: Update config (password) - Keeping for backwards compatibility
-app.post("/api/config", async (req, res) => {
-  const { adminPassword } = req.body;
-  if (!adminPassword || adminPassword.trim().length === 0) {
-    res.status(400).json({ success: false, message: "올바른 비밀번호를 입력해주세요." });
-    return;
-  }
-  await saveConfigAsync({ adminPassword: adminPassword.trim() });
-  res.json({ success: true, message: "비밀번호가 성공적으로 변경되었습니다." });
-});
-
-// API: Get all submissions (optionally filtered by classCode)
-app.get("/api/submissions", async (req, res) => {
-  const { classCode } = req.query;
-  const submissions = await getSubmissionsAsync(classCode as string);
-  res.json(submissions);
-});
-
-// API: Delete a submission (for teacher dashboard management)
-app.delete("/api/submissions/:id", async (req, res) => {
-  const { id } = req.params;
-  const success = await deleteSubmissionAsync(id);
-  if (!success) {
-    res.status(404).json({ success: false, message: "Submission not found" });
-    return;
-  }
+app.post("/api/classes/logout", requireTeacherOrigin, (_req, res) => {
+  clearTeacherCookie(res);
   res.json({ success: true });
 });
 
-// API: Reset all submissions for a class
-app.post("/api/submissions/reset", async (req, res) => {
-  const { classCode } = req.body;
-  if (!classCode) {
-    res.status(400).json({ success: false, message: "학급 코드가 필요합니다." });
-    return;
+// API: Authenticate class (Login or Auto-Register)
+app.post("/api/classes/auth", requireTeacherOrigin, teacherConfiguration, teacherRateLimit, async (req, res) => {
+  const { classCode, password } = req.body || {};
+  if (typeof classCode !== "string" || !classCode.trim()
+    || typeof password !== "string" || !password.trim()) {
+    res.status(400).json({ success: false, message: "학급 코드와 비밀번호를 올바르게 입력해주세요." }); return;
   }
-  await resetSubmissionsAsync(classCode);
-  res.json({ success: true, message: "submissions cleared for class: " + classCode });
+  const trimmedCode = classCode.toLowerCase().trim();
+  try {
+    const existingClass = await getClassAsync(trimmedCode);
+    if (existingClass) {
+      if (!(await verifyClassPassword(password, existingClass)).valid) {
+        res.status(401).json({ success: false, message: "비밀번호가 일치하지 않습니다. 다시 입력해주세요." }); return;
+      }
+      issueTeacherCookie(res, existingClass.classCode, existingClass.authVersion ?? 0);
+      res.json({ success: true, isNew: false, classCode: existingClass.classCode, message: "로그인에 성공했습니다." });
+    } else {
+      const created = await saveClassAsync(trimmedCode, password, true);
+      issueTeacherCookie(res, created.classCode, created.authVersion ?? 0);
+      res.json({ success: true, isNew: true, classCode: created.classCode, message: "새로운 학급 대시보드가 성공적으로 개설되었습니다!" });
+    }
+  } catch {
+    res.status(503).json({ success: false, message: "로그인 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요." });
+  }
 });
 
-// API: Submit survey
-app.post("/api/submissions", async (req, res) => {
-  const { grade, classNumber, studentNumber, name, keywords, apiKey, classCode } = req.body;
-  const clientApiKey = req.headers["x-gemini-api-key"] as string || apiKey;
-
-  if (!grade || !classNumber || !studentNumber || !name || !keywords || keywords.length !== 5) {
-    res.status(400).json({ success: false, message: "모든 항목을 올바르게 채워주세요. (키워드는 정확히 5개)" });
-    return;
+async function changeTeacherPassword(req: express.Request, res: express.Response) {
+  const { oldPassword, newPassword } = req.body || {};
+  if (typeof oldPassword !== "string" || !oldPassword.trim()
+    || typeof newPassword !== "string" || !newPassword.trim()) {
+    res.status(400).json({ success: false, message: "현재 비밀번호와 새 비밀번호를 입력해주세요." }); return;
   }
+  const cls = res.locals.teacherClass as ClassConfig;
+  try {
+    if (!(await verifyClassPassword(oldPassword, cls)).valid) {
+      res.status(401).json({ success: false, code: "CURRENT_PASSWORD_INVALID", message: "현재 비밀번호가 일치하지 않습니다." }); return;
+    }
+    // Ignore body.classCode; the verified session determines the target.
+    const saved = await saveClassAsync(cls.classCode, newPassword, false, cls);
+    issueTeacherCookie(res, saved.classCode, saved.authVersion ?? 0);
+    res.json({ success: true, message: "비밀번호가 성공적으로 변경되었습니다." });
+  } catch {
+    res.status(409).json({ success: false, message: "비밀번호 변경을 완료하지 못했습니다. 다시 로그인한 뒤 확인해주세요." });
+  }
+}
 
-  const newId = Date.now().toString();
+app.post("/api/classes/change-password", requireTeacherOrigin, teacherConfiguration, teacherRateLimit, requireTeacherSession, changeTeacherPassword);
+app.post("/api/classes/update-password", requireTeacherOrigin, teacherConfiguration, teacherRateLimit, requireTeacherSession, changeTeacherPassword);
+
+// Retired public config endpoints. Existing config documents remain untouched.
+app.all("/api/config", (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.status(410).json({ success: false, message: "이 설정 API는 더 이상 제공되지 않습니다." });
+});
+
+// Reject explicit cross-class requests; never derive authorization from them.
+function requireTeacherClassScope(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const classCode = res.locals.teacherClass.classCode;
+  for (const requested of [req.query.classCode, req.body?.classCode]) {
+    if (requested !== undefined && requested !== classCode) {
+      res.status(403).json({ success: false, message: "다른 학급 자료에 접근할 수 없습니다." }); return;
+    }
+  }
+  next();
+}
+
+app.get("/api/submissions", requireTeacherSession, requireTeacherClassScope, async (_req, res) => {
+  try {
+    res.json(await getSubmissionsAsync(res.locals.teacherClass.classCode));
+  } catch {
+    res.status(503).json({ success: false, message: "제출 자료를 조회할 수 없습니다. 잠시 후 다시 시도해주세요." });
+  }
+});
+
+app.delete("/api/submissions/:id", requireTeacherOrigin, requireTeacherSession, requireTeacherClassScope, async (req, res) => {
+  try {
+    if (!await deleteSubmissionAsync(req.params.id, res.locals.teacherClass.classCode)) {
+      res.status(404).json({ success: false, message: "접근 가능한 제출 자료를 찾을 수 없습니다." }); return;
+    }
+    res.json({ success: true });
+  } catch {
+    res.status(503).json({ success: false, message: "삭제를 완료하지 못했습니다. 자료를 다시 조회해주세요." });
+  }
+});
+
+app.post("/api/submissions/reset", requireTeacherOrigin, requireTeacherSession, requireTeacherClassScope, async (_req, res) => {
+  try {
+    await resetSubmissionsAsync(res.locals.teacherClass.classCode);
+    res.json({ success: true, message: "현재 학급의 제출 자료를 초기화했습니다." });
+  } catch {
+    res.status(503).json({ success: false, message: "초기화를 완료하지 못했습니다. 일부 자료가 처리됐을 수 있으니 다시 조회해주세요." });
+  }
+});
+
+// Strict student input validation; generated fields are never taken from the body.
+function validateStudentInput(body: unknown): {
+  grade: string; classNumber: string; studentNumber: string; name: string; keywords: string[]; classCode: string; apiKey?: string;
+} | null {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  const data = body as Record<string, unknown>;
+  const allowed = ["grade", "classNumber", "studentNumber", "name", "keywords", "classCode", "apiKey"];
+  if (Object.keys(data).some(key => !allowed.includes(key))) return null;
+  const text = (value: unknown, max: number): value is string =>
+    typeof value === "string" && value.trim().length > 0 && value.length <= max && !/[\u0000-\u001f\u007f]/.test(value);
+  const positiveNumber = (value: unknown): value is string =>
+    text(value, 3) && /^[0-9]{1,3}$/.test(value) && Number(value) > 0;
+  if (!positiveNumber(data.grade) || !positiveNumber(data.classNumber) || !positiveNumber(data.studentNumber)
+    || !text(data.name, 50) || !text(data.classCode, 100)
+    || !/^[a-z0-9][a-z0-9_-]{0,99}$/i.test(data.classCode.trim())
+    || !Array.isArray(data.keywords) || data.keywords.length !== 5
+    || !data.keywords.every(keyword => text(keyword, 100))
+    || (data.apiKey !== undefined && !text(data.apiKey, 512))) return null;
+  return {
+    grade: data.grade, classNumber: data.classNumber, studentNumber: data.studentNumber,
+    name: data.name.trim(), keywords: data.keywords.map(keyword => keyword.trim()),
+    classCode: data.classCode.trim().toLowerCase(),
+    ...(typeof data.apiKey === "string" ? { apiKey: data.apiKey } : {})
+  };
+}
+
+// API: Submit survey (intentionally does not require a teacher cookie)
+app.post("/api/submissions", async (req, res) => {
+  try {
+  const input = validateStudentInput(req.body);
+  const headerKey = req.headers["x-gemini-api-key"];
+  if (!input || (headerKey !== undefined && (typeof headerKey !== "string" || headerKey.length > 512))) {
+    res.status(400).json({ success: false, message: "학급 코드와 학생 정보를 확인해주세요. 키워드는 정확히 5개여야 합니다." }); return;
+  }
+  const { grade, classNumber, studentNumber, name, keywords, apiKey, classCode } = input;
+  const clientApiKey = headerKey as string || apiKey;
+  try {
+    if (!await getClassAsync(classCode)) {
+      res.status(404).json({ success: false, message: "존재하지 않는 학급 코드입니다." }); return;
+    }
+  } catch {
+    res.status(503).json({ success: false, message: "학급 정보를 확인할 수 없습니다. 잠시 후 다시 시도해주세요." }); return;
+  }
+  const newId = randomUUID();
 
   // Create base submission using robust rule-based generator
   const fallback = generateFallbackText(name, keywords);
@@ -950,7 +614,7 @@ app.post("/api/submissions", async (req, res) => {
     timestamp: new Date().toISOString(),
     aiFeedback: fallback.aiFeedback,
     reportCardDraft: fallback.reportCardDraft,
-    classCode: classCode || "default"
+    classCode
   };
 
   // Get dynamic Gemini client
@@ -959,38 +623,8 @@ app.post("/api/submissions", async (req, res) => {
   // Enhance with Gemini if key is active
   if (activeAi) {
     try {
-      const keywordsStr = keywords.join(", ");
-      const prompt = `
-당신은 대한민국 초등학교/중학교 교사이자 다정한 어린이 상담사입니다.
-학생이 자신을 표현하는 5가지 핵심 키워드를 골랐습니다. 이 키워드를 기반으로 학생에게 주는 다정한 피드백 카드 내용과 교사가 생활기록부(행동특성 및 종합의견 또는 교과세특)에 기재할 수 있는 고품질 추천 초안 문구를 작성해주세요.
-
-[학생 정보]
-이름: ${name} (${grade}학년 ${classNumber}반 ${studentNumber}번)
-학생이 직접 선택한 자신을 나타내는 5가지 키워드: [${keywordsStr}]
-
-[출력 요구사항 - 반드시 JSON 형식으로만 응답할 것]
-반드시 아래의 JSON 구조만 반환해주세요. 마크다운 블록(\`\`\`json)은 포함하지 말고 순수 JSON 문자열로만 응답하세요.
-
-{
-  "aiFeedback": "격려 메시지",
-  "reportCardDraft": "생활기록부 초안 문구"
-}
-
-[중요 지침: 학생 피드백 (aiFeedback) 작성 규칙]
-1. 학생의 이름을 다정하게 부를 때, 반드시 'ㅁㅁ야' 또는 'ㅁㅁ아' 형태로 부르십시오. (예: 이름이 '김민준'인 경우 성을 떼고 '민준아!', '이서연'인 경우 성을 떼고 '서연아!', '최지우'인 경우 '지우야!'라고 시작하세요.) 'ㅁㅁㅁ 친구'나 'ㅁㅁㅁ 어린이' 같은 딱딱하거나 격식차린 표현은 절대로 사용하지 마십시오.
-2. 학생이 선택한 키워드를 자연스럽게 칭찬하고 용기를 주는 따뜻한 어린이 맞춤형 격려 메시지를 작성하십시오. (경어체, 2~3문장)
-
-[중요 지침: 생활기록부 추천 초안 (reportCardDraft) 작성 규칙]
-1. 모든 문장의 끝은 반드시 '~함.' 또는 '~임.'으로 끝나야 합니다. (온점/마침표 포함)
-   - 절대 '~함'이나 '~임'처럼 마침표 없이 끝내지 마십시오. 반드시 마침표 '.'를 포함해야 합니다.
-   - 절대 '~할 수 있음', '~수 있음', '~있습니다', '~입니다', '~함이 돋보입니다', '~행동을 보여줌' 이외에 다른 끝맺음이나 '~수 있음(X)' 형태는 쓰지 마십시오. 오직 명사형 종결어미 '~함.', '~임.'으로만 끝나야 합니다. (예: '참여함.', '우수함.', '돋보임.')
-2. 줄 바꿈(개행 문자 \\n)을 절대 사용하지 마십시오. 문장이 끝나도 줄을 바꾸지 않고, 온점 후 정확히 한 칸을 띄운 뒤(예: '. ') 이어서 한 줄의 완성된 문단으로 기록하십시오.
-3. 영문 알파벳이나 수학적 특수문자(+, -, X 등)는 절대 기재하지 마십시오. 수학 기호나 특수문자는 반드시 한글로 풀어서 기재하십시오. (예: '+' -> '더하기' 또는 '덧셈', '-' -> '빼기' 또는 '뺄셈', 'X' 또는 '*' -> '곱하기' 또는 '곱셈').
-   - 단, 측정 단위인 'cm', 'kg' 등은 영문 알파벳 기재가 허용됩니다.
-4. 학생이 선택한 5가지 키워드를 그대로 문장 속에 Verbatim(토씨 하나 안 틀리고 그대로)으로 나열하지 마십시오. 그 키워드의 의미와 표현을 문장 속에 잘 녹여내어 자연스럽고 아름답게 활용하여 고품질의 관찰 서술 문장으로 다듬어 작성하십시오. (글자 수: 공백 포함 약 150자 ~ 220자 사이)
-`;
-
-      const response = await activeAi.models.generateContent({
+      const prompt = buildTeacherFeedbackPrompt({ name, grade, classNumber, studentNumber, keywords });
+const response = await activeAi.models.generateContent({
         model: "gemini-2.5-flash",
         contents: prompt,
         config: {
@@ -1021,18 +655,29 @@ app.post("/api/submissions", async (req, res) => {
   newSubmission.aiFeedback = postProcessFeedback(newSubmission.aiFeedback, name);
   newSubmission.reportCardDraft = postProcessDraft(newSubmission.reportCardDraft);
 
-  await addSubmissionAsync(newSubmission);
+  try { await addSubmissionAsync(newSubmission); }
+  catch {
+    res.status(503).json({ success: false, message: "제출 저장을 확인하지 못했습니다. 선생님께 확인한 뒤 다시 시도해주세요." }); return;
+  }
 
   res.json({ success: true, submission: newSubmission });
+  } catch {
+    res.status(503).json({ success: false, message: "제출을 처리하지 못했습니다. 잠시 후 다시 시도해주세요." });
+  }
 });
 
 // API: Manually request AI Draft generation for a specific existing student
-app.post("/api/submissions/:id/regenerate-ai", async (req, res) => {
+app.post("/api/submissions/:id/regenerate-ai", requireTeacherOrigin, requireTeacherSession, requireTeacherClassScope, async (req, res) => {
   const { id } = req.params;
-  const { apiKey, classCode } = req.body;
+  const { apiKey } = req.body || {};
+  const classCode = res.locals.teacherClass.classCode;
   const clientApiKey = req.headers["x-gemini-api-key"] as string || apiKey;
 
-  const submissions = await getSubmissionsAsync(classCode);
+  let submissions: StudentSubmission[];
+  try { submissions = await getSubmissionsAsync(classCode); }
+  catch {
+    res.status(503).json({ success: false, message: "제출 자료를 확인할 수 없습니다. 잠시 후 다시 시도해주세요." }); return;
+  }
   const subIndex = submissions.findIndex((s) => s.id === id);
 
   if (subIndex === -1) {
@@ -1049,38 +694,14 @@ app.post("/api/submissions/:id/regenerate-ai", async (req, res) => {
   }
 
   try {
-    const keywordsStr = student.keywords.join(", ");
-    const prompt = `
-당신은 대한민국 초등학교/중학교 교사이자 다정한 어린이 상담사입니다.
-학생이 자신을 표현하는 5가지 핵심 키워드를 골랐습니다. 이 키워드를 기반으로 학생에게 주는 다정한 피드백 카드 내용과 교사가 생활기록부(행동특성 및 종합의견 또는 교과세특)에 기재할 수 있는 고품질 추천 초안 문구를 작성해주세요.
-
-[학생 정보]
-이름: ${student.name} (${student.grade}학년 ${student.classNumber}반)
-선택한 키워드: [${keywordsStr}]
-
-[출력 요구사항 - 반드시 JSON 형식으로만 응답할 것]
-반드시 아래의 JSON 구조만 반환해주세요. 마크다운 블록(\`\`\`json)은 포함하지 말고 순수 JSON 문자열로만 응답하세요.
-
-{
-  "aiFeedback": "격려 메시지",
-  "reportCardDraft": "생활기록부 초안 문구"
-}
-
-[중요 지침: 학생 피드백 (aiFeedback) 작성 규칙]
-1. 학생의 이름을 다정하게 부를 때, 반드시 'ㅁㅁ야' 또는 'ㅁㅁ아' 형태로 부르십시오. (예: 이름이 '김민준'인 경우 성을 떼고 '민준아!', '이서연'인 경우 성을 떼고 '서연아!', '최지우'인 경우 '지우야!'라고 시작하세요.) 'ㅁㅁㅁ 친구'나 'ㅁㅁㅁ 어린이' 같은 딱딱하거나 격식차린 표현은 절대로 사용하지 마십시오.
-2. 학생이 선택한 키워드를 자연스럽게 칭찬하고 용기를 주는 따뜻한 어린이 맞춤형 격려 메시지를 작성하십시오. (경어체, 2~3문장)
-
-[중요 지침: 생활기록부 추천 초안 (reportCardDraft) 작성 규칙]
-1. 모든 문장의 끝은 반드시 '~함.' 또는 '~임.'으로 끝나야 합니다. (온점/마침표 포함)
-   - 절대 '~함'이나 '~임'처럼 마침표 없이 끝내지 마십시오. 반드시 마침표 '.'를 포함해야 합니다.
-   - 절대 '~할 수 있음', '~수 있음', '~있습니다', '~입니다', '~함이 돋보입니다', '~행동을 보여줌' 이외에 다른 끝맺음이나 '~수 있음(X)' 형태는 쓰지 마십시오. 오직 명사형 종결어미 '~함.', '~임.'으로만 끝나야 합니다. (예: '참여함.', '우수함.', '돋보임.')
-2. 줄 바꿈(개행 문자 \\n)을 절대 사용하지 마십시오. 문장이 끝나도 줄을 바꾸지 않고, 온점 후 정확히 한 칸을 띄운 뒤(예: '. ') 이어서 한 줄의 완성된 문단으로 기록하십시오.
-3. 영문 알파벳이나 수학적 특수문자(+, -, X 등)는 절대 기재하지 마십시오. 수학 기호나 특수문자는 반드시 한글로 풀어서 기재하십시오. (예: '+' -> '더하기' 또는 '덧셈', '-' -> '빼기' 또는 '뺄셈', 'X' 또는 '*' -> '곱하기' 또는 '곱셈').
-   - 단, 측정 단위인 'cm', 'kg' 등은 영문 알파벳 기재가 허용됩니다.
-4. 학생이 선택한 5가지 키워드를 그대로 문장 속에 Verbatim(토씨 하나 안 틀리고 그대로)으로 나열하지 마십시오. 그 키워드의 의미 and 표현을 문장 속에 잘 녹여내어 자연스럽고 아름답게 활용하여 고품질의 관찰 서술 문장으로 다듬어 작성하십시오. (글자 수: 공백 포함 약 150자 ~ 220자 사이)
-`;
-
-    const response = await activeAi.models.generateContent({
+    const prompt = buildTeacherFeedbackPrompt({
+      name: student.name,
+      grade: student.grade,
+      classNumber: student.classNumber,
+      studentNumber: student.studentNumber,
+      keywords: student.keywords,
+    });
+const response = await activeAi.models.generateContent({
       model: "gemini-2.5-flash",
       contents: prompt,
       config: {
@@ -1102,7 +723,10 @@ app.post("/api/submissions/:id/regenerate-ai", async (req, res) => {
       student.aiFeedback = postProcessFeedback(student.aiFeedback, student.name);
       student.reportCardDraft = postProcessDraft(student.reportCardDraft);
 
-      await updateSubmissionAsync(student);
+      try { await updateSubmissionAsync(student, classCode); }
+      catch {
+        res.status(503).json({ success: false, message: "자료 접근 권한 또는 저장 상태가 변경되어 저장하지 못했습니다. 다시 조회해주세요." }); return;
+      }
       res.json({ success: true, student });
       return;
     }
@@ -1117,7 +741,7 @@ app.post("/api/submissions/:id/regenerate-ai", async (req, res) => {
 
 // Serve frontend assets
 async function startServer() {
-  await initDatabase();
+  getServerFirestore(); // Configuration errors stop startup; no alternate store.
 
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -1138,4 +762,7 @@ async function startServer() {
   });
 }
 
-startServer();
+startServer().catch(() => {
+  console.error("Server startup failed. Check server configuration.");
+  process.exitCode = 1;
+});

@@ -13,8 +13,21 @@ interface TeacherDashboardProps {
   lastUpdated: number;
 }
 
+async function teacherFetch(url: string, options: RequestInit = {}): Promise<Response> {
+  const response = await fetch(url, { ...options, credentials: "same-origin", cache: "no-store" });
+  if (response.status === 401) {
+    window.dispatchEvent(new Event("teacher-session-expired"));
+    throw new Error("Teacher session expired");
+  }
+  if (!response.ok) {
+    const error = await response.clone().json().catch(() => ({}));
+    alert(error.message || "요청을 처리하지 못했습니다. 잠시 후 다시 시도해주세요.");
+  }
+  return response;
+}
+
 export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps) {
-  const [classCode] = useState(() => localStorage.getItem("teacher_class_code") || "default");
+  const [classCode, setClassCode] = useState("");
   const [submissions, setSubmissions] = useState<StudentSubmission[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshTrigger, setRefreshTrigger] = useState(0);
@@ -24,6 +37,7 @@ export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps)
 
   // Password Settings modal states
   const [showPasswordSettings, setShowPasswordSettings] = useState(false);
+  const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [passwordChangeSuccess, setPasswordChangeSuccess] = useState(false);
   const [passwordChangeError, setPasswordChangeError] = useState("");
@@ -54,12 +68,25 @@ export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps)
 
   // Load submissions on mount and when refresh is triggered
   useEffect(() => {
+    let cancelled = false;
     const fetchSubmissions = async () => {
       setLoading(true);
       try {
-        const res = await fetch(`/api/submissions?classCode=${encodeURIComponent(classCode)}`);
+        const sessionResponse = await fetch("/api/classes/session", { credentials: "same-origin", cache: "no-store" });
+        if (cancelled) return;
+        if (!sessionResponse.ok) {
+          setSubmissions([]);
+          if (sessionResponse.status === 401) window.dispatchEvent(new Event("teacher-session-expired"));
+          return;
+        }
+        const session = await sessionResponse.json();
+        if (cancelled) return;
+        setClassCode(session.classCode);
+        const res = await teacherFetch("/api/submissions");
+        if (cancelled) return;
         if (res.ok) {
           const data = await res.json();
+          if (cancelled) return;
           setSubmissions(data);
           
           // Update active student modal data reactively if open
@@ -73,12 +100,15 @@ export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps)
       } catch (e) {
         console.error("Failed to load submissions", e);
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     };
 
     fetchSubmissions();
-  }, [refreshTrigger, lastUpdated, classCode]);
+    const refreshSession = () => setRefreshTrigger(prev => prev + 1);
+    window.addEventListener("focus", refreshSession);
+    return () => { cancelled = true; window.removeEventListener("focus", refreshSession); };
+  }, [refreshTrigger, lastUpdated]);
 
   // Unique list of classes in current submissions
   const availableClasses = useMemo(() => {
@@ -214,7 +244,7 @@ export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps)
   const handleDelete = async (id: string) => {
     if (!confirm("정말 이 학생의 설문 제출을 삭제하시겠습니까?")) return;
     try {
-      const res = await fetch(`/api/submissions/${id}`, { method: "DELETE" });
+      const res = await teacherFetch(`/api/submissions/${id}`, { method: "DELETE" });
       if (res.ok) {
         setRefreshTrigger(prev => prev + 1);
       }
@@ -232,13 +262,13 @@ export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps)
     }
     setRegeneratingId(id);
     try {
-      const res = await fetch(`/api/submissions/${id}/regenerate-ai`, {
+      const res = await teacherFetch(`/api/submissions/${id}/regenerate-ai`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "x-gemini-api-key": localApiKey
         },
-        body: JSON.stringify({ classCode })
+        body: JSON.stringify({})
       });
       if (res.ok) {
         setRefreshTrigger(prev => prev + 1);
@@ -260,10 +290,10 @@ export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps)
       return;
     }
     try {
-      const res = await fetch("/api/submissions/reset", {
+      const res = await teacherFetch("/api/submissions/reset", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ classCode })
+        body: JSON.stringify({})
       });
       if (res.ok) {
         setSubmissions([]);
@@ -329,13 +359,16 @@ export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps)
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            classCode,
+            oldPassword: currentPassword,
             newPassword: newPassword.trim()
           })
         });
 
         if (!res.ok) {
           const errData = await res.json();
+          if (res.status === 401 && errData.code !== "CURRENT_PASSWORD_INVALID") {
+            window.dispatchEvent(new Event("teacher-session-expired"));
+          }
           setPasswordChangeError(errData.message || "비밀번호 변경에 실패했습니다.");
           return;
         }
@@ -345,6 +378,9 @@ export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps)
         return;
       }
     }
+
+    setCurrentPassword("");
+    setNewPassword("");
 
     // 2. Always update local Gemini API Key in localStorage
     const cleanedKey = newApiKeyInput.trim();
@@ -395,6 +431,7 @@ export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps)
             onClick={() => {
               setShowPasswordSettings(true);
               setNewPassword("");
+              setCurrentPassword("");
               setNewApiKeyInput(localApiKey);
               setPasswordChangeSuccess(false);
               setPasswordChangeError("");
@@ -956,11 +993,26 @@ export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps)
                   비밀번호를 바꿀 수 있으며, 개인 Gemini API 키를 로컬 브라우저에 직접 등록하여 사용하실 수 있습니다.
                 </p>
 
+                {/* Current password is required only when changing the password. */}
+                <div className="space-y-1.5">
+                  <label htmlFor="current-password-input" className="text-xs font-bold text-slate-600">현재 비밀번호</label>
+                  <input
+                    id="current-password-input"
+                    type="password"
+                    autoComplete="current-password"
+                    value={currentPassword}
+                    onChange={(e) => setCurrentPassword(e.target.value)}
+                    required={!!newPassword.trim()}
+                    placeholder="비밀번호 변경 시 입력"
+                    className="w-full px-3.5 py-2.5 text-sm border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  />
+                </div>
                 {/* Password Input */}
                 <div className="space-y-1.5" id="password-input-group">
                   <label className="text-xs font-bold text-slate-600">대시보드 비밀번호 변경 (선택)</label>
                   <input
-                    type="text"
+                    type="password"
+                    autoComplete="new-password"
                     placeholder="새 비밀번호 (미입력 시 유지)"
                     value={newPassword}
                     onChange={(e) => setNewPassword(e.target.value)}
@@ -1209,3 +1261,4 @@ export default function TeacherDashboard({ lastUpdated }: TeacherDashboardProps)
     </div>
   );
 }
+
