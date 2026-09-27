@@ -7,9 +7,13 @@ import { StudentSubmission } from "./src/types";
 import { createPasswordHash, verifyClassPassword } from "./server/password";
 import { assertTeacherAuthConfigured, issueTeacherCookie, clearTeacherCookie, readTeacherSession, requireTeacherOrigin, teacherRateLimit } from "./server/teacher-auth";
 import { getServerFirestore } from "./server/firestore";
+import { createWindowRateLimiter } from "./server/request-limit";
 import { FieldValue } from "firebase-admin/firestore";
 
 const app = express();
+
+const studentRequestLimit = createWindowRateLimiter(15 * 60 * 1000);
+const aiRequestLimit = createWindowRateLimiter(15 * 60 * 1000);
 
 export function resolvePort(value = process.env.PORT): number {
   const parsed = Number(value);
@@ -257,7 +261,7 @@ function getGeminiClient(customKey?: string): GoogleGenAI | null {
       },
     });
   } catch (e) {
-    console.error("Failed to initialize Gemini Client", e);
+    console.error("Failed to initialize Gemini Client");
     return null;
   }
 }
@@ -399,7 +403,7 @@ if (process.env.GEMINI_API_KEY) {
     });
     console.log("Gemini API Client successfully initialized.");
   } catch (e) {
-    console.error("Failed to initialize Gemini API Client", e);
+    console.error("Failed to initialize Gemini API Client");
   }
 } else {
   console.warn("GEMINI_API_KEY environment variable is missing. App will use fallback rule-based generation.");
@@ -600,6 +604,13 @@ app.post("/api/submissions", async (req, res) => {
   } catch {
     res.status(503).json({ success: false, message: "학급 정보를 확인할 수 없습니다. 잠시 후 다시 시도해주세요." }); return;
   }
+  // Avoid an IP-only quota: classmates can share one school network.
+  const studentQuota = studentRequestLimit("student:" + JSON.stringify([classCode, grade, classNumber, studentNumber]), 8);
+  const classQuota = studentQuota.allowed ? studentRequestLimit("class:" + classCode, 300) : studentQuota;
+  if (!studentQuota.allowed || !classQuota.allowed) {
+    res.setHeader("Retry-After", String(Math.max(studentQuota.retryAfterSeconds, classQuota.retryAfterSeconds)));
+    res.status(429).json({ success: false, message: "요청이 너무 많습니다. 잠시 후 다시 시도해주세요." }); return;
+  }
   const newId = randomUUID();
 
   // Create base submission using robust rule-based generator
@@ -643,11 +654,11 @@ const response = await activeAi.models.generateContent({
             newSubmission.reportCardDraft = postProcessDraft(result.reportCardDraft);
           }
         } catch (parseError) {
-          console.error("Failed to parse Gemini JSON output, using default drafts", parseError, responseText);
+          console.error("Failed to parse Gemini JSON output, using default drafts");
         }
       }
     } catch (apiError) {
-      console.error("Gemini API execution failed, utilizing rich local fallback drafts", apiError);
+      console.error("Gemini API execution failed, utilizing rich local fallback drafts");
     }
   }
 
@@ -693,6 +704,13 @@ app.post("/api/submissions/:id/regenerate-ai", requireTeacherOrigin, requireTeac
     return;
   }
 
+  const submissionQuota = aiRequestLimit("ai:submission:" + classCode + ":" + id, 6);
+  const classQuota = submissionQuota.allowed ? aiRequestLimit("ai:class:" + classCode, 60) : submissionQuota;
+  if (!submissionQuota.allowed || !classQuota.allowed) {
+    res.setHeader("Retry-After", String(Math.max(submissionQuota.retryAfterSeconds, classQuota.retryAfterSeconds)));
+    res.status(429).json({ success: false, message: "요청이 너무 많습니다. 잠시 후 다시 시도해주세요." }); return;
+  }
+
   try {
     const prompt = buildTeacherFeedbackPrompt({
       name: student.name,
@@ -731,7 +749,7 @@ const response = await activeAi.models.generateContent({
       return;
     }
   } catch (error) {
-    console.error("Failed to regenerate AI text", error);
+    console.error("Failed to regenerate AI text");
     res.status(500).json({ success: false, message: "AI 생성 중 오류가 발생했습니다. 입력하신 API 키가 올바른지 확인해주세요." });
     return;
   }
