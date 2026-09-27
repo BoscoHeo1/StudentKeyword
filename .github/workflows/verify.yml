@@ -33,6 +33,8 @@ jobs:
         run: node tests/phase52-security.cjs
       - name: AI feedback regression
         run: node --test tests/ai-feedback-regression.mjs
+      - name: Request limit regression
+        run: node --test tests/request-limit.mjs
 
   secret-scan:
     name: Gitleaks

@@ -26,6 +26,7 @@ function load(file, imports = {}, globals = {}, transform = s => s) {
 }
 const password = load("server/password.ts");
 const auth = load("server/teacher-auth.ts");
+const requestLimit = load("server/request-limit.ts");
 const deleted = Symbol("deleted");
 let records = new Map(), writes = 0, reads = 0, broken = false, writeFailure = false, aiCalls = 0;
 let nextId, beforeTransaction, failGeneration = false;
@@ -89,6 +90,7 @@ const server = load("server.ts", {
     return nextId || crypto.randomUUID();
   } },
   "./server/password": password, "./server/teacher-auth": auth,
+  "./server/request-limit": requestLimit,
   "./server/firestore": { getServerFirestore: () => { if (broken) throw Error("Unavailable"); return database; } },
   "firebase-admin/firestore": { FieldValue: { delete: () => deleted } }
 }, {}, s => s.slice(0, s.indexOf("startServer().catch")) +
@@ -204,12 +206,12 @@ async function main() {
   }
   assert.equal((await call("post", "/api/submissions", { body: { ...student, classCode: "missing" } })).statusCode, 404);
   const names = ["홍길동", "[", "]", "김(민수)", "A+B", "test.*", "역\\슬래시", "^$${}|?+*().[]\\", "$&"];
-  for (const name of names) {
+  for (const [index, name] of names.entries()) {
     const pattern = new RegExp("^" + server.escapeRegExp(name) + "$");
     assert.equal(pattern.test(name), true);
     assert.equal(pattern.test("prefix" + name), false);
     assert.doesNotThrow(() => server.postProcessFeedback(name + " 친구, 응원해요!", name));
-    const named = await call("post", "/api/submissions", { body: { ...student, name } });
+    const named = await call("post", "/api/submissions", { body: { ...student, name, studentNumber: String(index + 1) } });
     assert.equal(named.statusCode, 200);
     assert.equal(named.data.submission.name, name);
   }
@@ -263,6 +265,22 @@ async function main() {
   assert.equal((await call("post", "/api/submissions/reset", { token: currentCookie, body: { classCode: "b" } })).statusCode, 403);
   assert.equal((await call("post", "/api/submissions/reset", { token: currentCookie })).statusCode, 200);
   assert.ok(records.has("submissions/b1")); assert.ok(records.has("submissions/legacy"));
+  // Limit checks use the real route handlers and mocked database/AI only.
+  const repeatedStudent = { ...student, classCode: "b", studentNumber: "90" };
+  for (let n = 0; n < 8; n++) assert.equal((await call("post", "/api/submissions", { body: repeatedStudent })).statusCode, 200);
+  const writesBeforeLimit = writes;
+  r = await call("post", "/api/submissions", { body: repeatedStudent });
+  assert.equal(r.statusCode, 429); assert.ok(Number(r.headers["Retry-After"]) > 0);
+  assert.equal(writes, writesBeforeLimit);
+  assert.equal((await call("post", "/api/submissions", { body: { ...repeatedStudent, classCode: "a" } })).statusCode, 200);
+  assert.equal((await call("get", "/api/classes/session", { token: currentCookie })).statusCode, 200);
+  const teacherB = await call("post", "/api/classes/auth", { body: { classCode: "b", password: "hashed" } });
+  assert.equal(teacherB.statusCode, 200);
+  for (let n = 0; n < 6; n++) assert.equal((await call("post", "/api/submissions/:id/regenerate-ai", { token: teacherB.cookieValue, id: "b1", body: { apiKey: "mock" } })).statusCode, 200);
+  const aiCallsBeforeLimit = aiCalls;
+  r = await call("post", "/api/submissions/:id/regenerate-ai", { token: teacherB.cookieValue, id: "b1", body: { apiKey: "mock" } });
+  assert.equal(r.statusCode, 429); assert.equal(aiCalls, aiCallsBeforeLimit);
+
   const beforeReads = reads;
   for (const method of ["get", "post"]) assert.equal((await call(method, "/api/config")).statusCode, 410);
   assert.equal(reads, beforeReads);
