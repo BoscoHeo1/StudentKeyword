@@ -50,6 +50,10 @@ export default function StudentSurvey({ onSurveySubmitted }: StudentSurveyProps)
 
     try {
       const res = await fetch(`/api/classes/check/${encodeURIComponent(classCode.trim().toLowerCase())}`);
+      if (!res.ok) {
+        setInfoError("학급 정보를 확인할 수 없습니다. 잠시 후 다시 시도해주세요.");
+        return;
+      }
       const checkData = await res.json();
       if (!checkData.exists) {
         setInfoError("입력하신 학급 코드가 존재하지 않습니다. 선생님이 대시보드에서 등록하신 정확한 코드를 입력해주세요!");
@@ -57,7 +61,8 @@ export default function StudentSurvey({ onSurveySubmitted }: StudentSurveyProps)
       }
     } catch (err) {
       console.error("Failed to check class code", err);
-      // Let it slide if there is an error
+      setInfoError("서버에 연결할 수 없습니다. 연결 상태를 확인한 뒤 다시 시도해주세요.");
+      return;
     }
 
     setInfoError("");
@@ -135,9 +140,9 @@ export default function StudentSurvey({ onSurveySubmitted }: StudentSurveyProps)
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          grade,
-          classNumber,
-          studentNumber,
+          grade: String(grade).trim(),
+          classNumber: String(classNumber).trim(),
+          studentNumber: String(studentNumber).trim(),
           name: name.trim(),
           keywords: selectedKeywords.map(k => k.text),
           classCode: classCode.trim().toLowerCase()
@@ -150,9 +155,12 @@ export default function StudentSurvey({ onSurveySubmitted }: StudentSurveyProps)
           setSubmittedData(data.submission);
           setStep('success');
           onSurveySubmitted(data.submission);
+        } else {
+          alert(data.message || "제출이 완료되지 않았습니다. 다시 확인해주세요.");
         }
       } else {
-        alert("제출에 실패했습니다. 다시 한번 시도해 주세요.");
+        const data = await response.json().catch(() => ({}));
+        alert(data.message || "제출에 실패했습니다. 다시 한번 시도해 주세요.");
       }
     } catch (e) {
       console.error("Failed to submit survey", e);
@@ -223,7 +231,7 @@ export default function StudentSurvey({ onSurveySubmitted }: StudentSurveyProps)
                       <button
                         key={g}
                         type="button"
-                        onClick={() => setGrade(g)}
+                        onClick={() => setGrade(String(g))}
                         className={`py-3.5 rounded-2xl text-sm font-extrabold border transition-all duration-200 hover:scale-[1.03] active:scale-[0.97] ${
                           grade === g
                             ? "bg-gradient-to-br from-pink-500 to-indigo-600 text-white border-transparent shadow-md shadow-pink-100"

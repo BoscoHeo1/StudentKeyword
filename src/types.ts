@@ -22,3 +22,4 @@ export interface AnalyticsSummary {
   domainCounts: Record<string, number>;
   submissionsByClass: Record<string, number>;
 }
+

@@ -6,3 +6,12 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Generated and local-only files
+server-dist/
+.firebase/
+/data/
+*.pem
+*.key
+*service-account*.json
+*credentials*.json
