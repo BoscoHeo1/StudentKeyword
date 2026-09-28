@@ -165,7 +165,7 @@ function buildTeacherFeedbackPrompt(input: {
 1. 실제 담임 선생님이 학생에게 직접 이야기하듯 자연스럽고 따뜻하게 작성하세요.
 2. 5개 키워드를 나열하지 말고 서로 연결해 학생의 강점과 앞으로의 가능성을 3~5문장으로 설명하세요.
 3. 초등학생이 쉽게 이해할 수 있는 말투를 사용하고, 과장된 칭찬·오글거리는 표현·광고 문구·반복 칭찬을 피하세요.
-4. 'AI', '인공지능', '마술사', '분석가', '데이터', '알고리즘'이라는 표현을 사용하지 마세요.
+4. 'AI', '인공지능', '마술사', '분석가', '데이터', '알고리즘', '분석 시스템'이라는 표현을 사용하지 마세요.
 5. 학생 이름은 전체에서 최대 1회만, 호칭 없이 입력된 이름 그대로 사용하세요. 이름 뒤에 '아'나 '야'를 붙이지 마세요.
 6. '민수아아', '민수야야', '민수야아'처럼 이름이나 호칭이 반복되는 표현을 만들지 마세요.
 
@@ -186,7 +186,7 @@ function postProcessFeedback(feedback: string, name: string): string {
   if (!feedback) return "";
   const fullName = name.trim();
   let cleaned = feedback
-    .replace(/AI|인공지능|마술사|분석가|데이터|알고리즘/gi, "")
+    .replace(/AI|인공지능|마술사|분석가|분석\s*시스템|데이터|알고리즘/gi, "")
     .replace(/[\r\n]+/g, " ")
     .trim();
   if (fullName) {
@@ -214,6 +214,17 @@ function postProcessFeedback(feedback: string, name: string): string {
         (_match, matchedName, particle: string) => matchedName + particleCorrections[particle]
       );
     }
+    let occurrenceCount = 0;
+    cleaned = cleaned.replace(
+      new RegExp("(" + escapedName + ")(?:(?:은|는|이|가|의)(?=[\\s,.!?]|$)\\s*|,?\\s*)", "g"),
+      (match) => {
+        occurrenceCount++;
+        if (occurrenceCount === 1) {
+          return match;
+        }
+        return "";
+      }
+    );
   }
 
   cleaned = cleaned
