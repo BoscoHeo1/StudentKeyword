@@ -38,6 +38,33 @@ function countOccurrences(text, searchStr) {
   return matches ? matches.length : 0;
 }
 
+function countNameMentions(text, name) {
+  if (!text || !name) return 0;
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const nameSuffixes = "처럼|보다|에게|한테|이랑|랑|은|는|이|가|을|를|와|과|의";
+  const regex = new RegExp(
+    "(?<![\\p{L}\\p{N}])" + escapedName + "(" + nameSuffixes + ")?(?=$|[^\\p{L}\\p{N}])",
+    "gu"
+  );
+  let count = 0;
+  for (const match of text.matchAll(regex)) {
+    const suffix = match[1] || "";
+    const offset = match.index;
+    const afterText = text.slice(offset + match[0].length);
+    // 동형어/일반명사 패턴인 경우 학생 이름 언급으로 카운트하지 않음
+    if (name === "하나") {
+      if (suffix === "의" && /^\s*[가-힣]+/.test(afterText)) continue;
+      if (suffix === "가" && /^\s*(?:되|만들|이루)/.test(afterText)) continue;
+    }
+    if (name === "우리" && /^\s*(?:반|학교|모둠|교실|친구|선생님|모두|동네|나라)/.test(afterText)) continue;
+    if (name === "보람" && /^\s*(?:느[끼꼈껴]|있|없|차|되|됐)/.test(afterText)) continue;
+    if (name === "사랑" && /^\s*(?:나[누눈눴]|넘[치쳤]|가득|받|주|하|했)/.test(afterText)) continue;
+    if (name === "믿음" && /^\s*(?:주|받|가[지졌]|깊|있)/.test(afterText)) continue;
+    count++;
+  }
+  return count;
+}
+
 function verifyFeedbackQuality(feedback, options = {}) {
   const { name, expectedKeywords, allowNoName = true, minSentences = 3, maxSentences = 5 } = options;
 
@@ -63,7 +90,7 @@ function verifyFeedbackQuality(feedback, options = {}) {
   // C & E. 이름 사용 및 호칭 검증
   if (name) {
     const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const nameOccurrences = countOccurrences(feedback, name);
+    const nameOccurrences = countNameMentions(feedback, name);
     assert.ok(
       nameOccurrences <= 1,
       `[QA 규칙 C] 학생 이름은 최대 1회만 허용됩니다. 현재: ${nameOccurrences}회 (내용: ${feedback})`
@@ -354,17 +381,69 @@ const repeatedNameCases = [
   ["의", "민수", "민수는 꾸준해. 민수의 성장을 기대할게.", "민수는 꾸준해. 너의 성장을 기대할게."],
   ["와 함께", "민수", "민수는 차분해. 민수와 함께 활동한 친구들도 즐거워했어.", "민수는 차분해. 너와 함께 활동한 친구들도 즐거워했어."],
   ["받침 있는 이름+처럼", "민석", "민석은 친구를 배려해. 친구들도 민석처럼 행동해.", "민석은 친구를 배려해. 친구들도 너처럼 행동해."],
-  ["받침 있는 이름+에게", "지훈", "지훈은 성실해. 선생님은 지훈에게 고마워.", "지훈은 성실해. 선생님은 너에게 고마워."]
+  ["받침 있는 이름+에게", "지훈", "지훈은 성실해. 선생님은 지훈에게 고마워.", "지훈은 성실해. 선생님은 너에게 고마워."],
+  // [조사 확장: 랑/이랑]
+  ["받침 없는 이름+랑", "민수", "민수는 성실해. 친구들은 민수랑 함께했어.", "민수는 성실해. 친구들은 너랑 함께했어."],
+  ["받침 있는 이름+이랑(민석)", "민석", "민석은 성실해. 친구들은 민석이랑 함께했어.", "민석은 성실해. 친구들은 너랑 함께했어."],
+  ["받침 있는 이름+이랑(지훈)", "지훈", "지훈은 책임감이 있어. 친구들은 지훈이랑 활동했어.", "지훈은 책임감이 있어. 친구들은 너랑 활동했어."],
+  ["받침 없는 이름+구어체 이랑", "민수", "민수는 성실해. 친구들은 민수이랑 함께했어.", "민수는 성실해. 친구들은 너랑 함께했어."]
 ];
 for (const [suffix, name, input, expected] of repeatedNameCases) {
   test("[이름 중복 문장 보존] " + suffix, () => {
     const processed = postProcessFeedback(input, name);
     assert.equal(processed, expected);
-    assert.equal(countOccurrences(processed, name), 1);
+    assert.equal(countNameMentions(processed, name), 1);
   });
 }
 
 test("[이름 경계] 일반 단어 속 같은 글자를 학생 이름으로 바꾸지 않음", () => {
   const input = "하나는 성실해. 친구들은 하나씩 준비했어.";
   assert.equal(postProcessFeedback(input, "하나"), input);
+});
+
+// -------------------------------------------------------------------------
+// [동형어/일반명사 오인 방지 필수 회귀 테스트]
+// -------------------------------------------------------------------------
+
+test("[동형어/일반명사 오인 방지] 학생 이름 '하나' - '하나의 목표' 명사구 보존", () => {
+  const input = "하나는 성실해. 친구들은 하나의 목표를 세웠어.";
+  const processed = postProcessFeedback(input, "하나");
+  assert.equal(processed, input);
+  assert.equal(countNameMentions(processed, "하나"), 1);
+});
+
+test("[동형어/일반명사 오인 방지] 학생 이름 '하나' - '하나씩' 접미사 보존", () => {
+  const input = "하나는 성실해. 친구들은 하나씩 준비했어.";
+  const processed = postProcessFeedback(input, "하나");
+  assert.equal(processed, input);
+  assert.equal(countNameMentions(processed, "하나"), 1);
+});
+
+test("[동형어/일반명사 오인 방지] 학생 이름 '하나' - '하나의 마음', '하나가 되어' 보존", () => {
+  const input1 = "하나는 친구들을 배려해. 모두가 하나의 마음으로 모였어.";
+  assert.equal(postProcessFeedback(input1, "하나"), input1);
+
+  const input2 = "하나는 참 따뜻해. 우리는 하나가 되어 과제를 완성했어.";
+  assert.equal(postProcessFeedback(input2, "하나"), input2);
+});
+
+test("[동형어/일반명사 오인 방지] 학생 이름 '우리' - 1인칭 복수 대명사 '우리 반' 보존", () => {
+  const input = "우리는 책임감이 있어. 우리 반 친구들도 함께 도왔어.";
+  const processed = postProcessFeedback(input, "우리");
+  assert.equal(processed, input);
+  assert.equal(countNameMentions(processed, "우리"), 1);
+});
+
+test("[동형어/일반명사 오인 방지] 학생 이름 '보람' - 일반명사 '보람을 느꼈어' 보존", () => {
+  const input = "보람은 성실해. 이번 활동에서 큰 보람을 느꼈어.";
+  const processed = postProcessFeedback(input, "보람");
+  assert.equal(processed, input);
+  assert.equal(countNameMentions(processed, "보람"), 1);
+});
+
+test("[동형어/일반명사 오인 방지] 학생 이름 '하나'에게 붙은 명백한 사람 조사는 너로 정상 변환", () => {
+  const input = "하나는 성실해. 친구들은 하나랑 함께 활동했어.";
+  const processed = postProcessFeedback(input, "하나");
+  assert.equal(processed, "하나는 성실해. 친구들은 너랑 함께 활동했어.");
+  assert.equal(countNameMentions(processed, "하나"), 1);
 });

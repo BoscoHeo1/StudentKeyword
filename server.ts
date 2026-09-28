@@ -206,26 +206,62 @@ function postProcessFeedback(feedback: string, name: string): string {
     if (isHangulSyllable) {
       const hasFinalConsonant = (lastCode - 0xac00) % 28 !== 0;
       const particleCorrections: Record<string, string> = hasFinalConsonant
-        ? { 는: "은", 가: "이", 를: "을", 와: "과" }
-        : { 은: "는", 이: "가", 을: "를", 과: "와" };
+        ? { 는: "은", 가: "이", 를: "을", 와: "과", 랑: "이랑" }
+        : { 은: "는", 이: "가", 을: "를", 과: "와", 이랑: "랑" };
       const incorrectParticles = Object.keys(particleCorrections).join("|");
       cleaned = cleaned.replace(
         new RegExp("(" + escapedName + ")(" + incorrectParticles + ")(?=\\s|[,.!?]|$)", "g"),
         (_match, matchedName, particle: string) => matchedName + particleCorrections[particle]
       );
     }
+
+    // 학생 이름 문자열이 일반명사/수사/관용구의 일부로 쓰인 경우 오인 치환 방지
+    const isHomonymOrCommonNoun = (suffix: string, offset: number, fullText: string, matchLen: number): boolean => {
+      const afterText = fullText.slice(offset + matchLen);
+      // 1. 이름이 '하나'인 경우: 수사/관형사구(하나의 목표/팀/꿈/마음 등), 관용구(하나가 되어 등) 보존
+      if (fullName === "하나") {
+        if (suffix === "의" && /^\s*[가-힣]+/.test(afterText)) {
+          return true;
+        }
+        if (suffix === "가" && /^\s*(?:되|만들|이루)/.test(afterText)) {
+          return true;
+        }
+      }
+      // 2. 이름이 '우리'인 경우: 1인칭 복수 대명사구(우리 반/학교/모둠/교실 등) 보존
+      if (fullName === "우리") {
+        if (/^\s*(?:반|학교|모둠|교실|친구|선생님|모두|동네|나라)/.test(afterText)) {
+          return true;
+        }
+      }
+      // 3. 이름이 '보람', '사랑', '믿음' 등 일반명사와 겹치는 경우
+      if (fullName === "보람" && /^\s*(?:느[끼꼈껴]|있|없|차|되|됐)/.test(afterText)) {
+        return true;
+      }
+      if (fullName === "사랑" && /^\s*(?:나[누눈눴]|넘[치쳤]|가득|받|주|하|했)/.test(afterText)) {
+        return true;
+      }
+      if (fullName === "믿음" && /^\s*(?:주|받|가[지졌]|깊|있)/.test(afterText)) {
+        return true;
+      }
+      return false;
+    };
+
     // Match complete name mentions only. Keep the first; use a natural
     // student-facing pronoun for later mentions and preserve their particles.
-    const nameSuffixes = "처럼|보다|에게|한테|은|는|이|가|을|를|와|과|의";
+    const nameSuffixes = "처럼|보다|에게|한테|이랑|랑|은|는|이|가|을|를|와|과|의";
     const nameMention = new RegExp(
       "(?<![\\p{L}\\p{N}])" + escapedName + "(" + nameSuffixes + ")?(?=$|[^\\p{L}\\p{N}])",
       "gu"
     );
     const secondPersonParticle: Record<string, string> = {
-      은: "는", 는: "는", 을: "를", 를: "를", 와: "와", 과: "와"
+      은: "는", 는: "는", 을: "를", 를: "를", 와: "와", 과: "와", 이랑: "랑", 랑: "랑"
     };
     let occurrenceCount = 0;
-    cleaned = cleaned.replace(nameMention, (match, suffix: string = "") => {
+    cleaned = cleaned.replace(nameMention, (match, suffix: string = "", offset: number, fullText: string) => {
+      // 일반명사/수사로 쓰인 경우는 학생 이름 언급이 아니므로 원문 보존 및 카운트 제외
+      if (isHomonymOrCommonNoun(suffix, offset, fullText, match.length)) {
+        return match;
+      }
       occurrenceCount++;
       if (occurrenceCount === 1) return match;
       if (suffix === "이" || suffix === "가") return "네가";
