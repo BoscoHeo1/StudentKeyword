@@ -1,0 +1,19 @@
+steps:
+  - id: checkout-exact-main
+    name: gcr.io/cloud-builders/git
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        git clone --depth=1 --branch=main https://github.com/BoscoHeo1/StudentKeyword.git /workspace/source
+        actual="$$(git -C /workspace/source rev-parse HEAD)"
+        test "$$actual" = "$_SOURCE_SHA"
+  - id: build-image
+    name: gcr.io/cloud-builders/docker
+    dir: source
+    args: [build, -t, '$_IMAGE', .]
+    waitFor: [checkout-exact-main]
+images: ['$_IMAGE']
+serviceAccount: projects/mykeyword-a832f/serviceAccounts/studentkeyword-build@mykeyword-a832f.iam.gserviceaccount.com
+options:
+  logging: CLOUD_LOGGING_ONLY
