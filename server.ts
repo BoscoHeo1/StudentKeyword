@@ -165,7 +165,7 @@ function buildTeacherFeedbackPrompt(input: {
 1. 실제 담임 선생님이 학생에게 직접 이야기하듯 자연스럽고 따뜻하게 작성하세요.
 2. 5개 키워드를 나열하지 말고 서로 연결해 학생의 강점과 앞으로의 가능성을 3~5문장으로 설명하세요.
 3. 초등학생이 쉽게 이해할 수 있는 말투를 사용하고, 과장된 칭찬·오글거리는 표현·광고 문구·반복 칭찬을 피하세요.
-4. 'AI', '인공지능', '마술사', '분석가', '데이터', '알고리즘'이라는 표현을 사용하지 마세요.
+4. 'AI', '인공지능', '마술사', '분석가', '데이터', '알고리즘', '분석 시스템'이라는 표현을 사용하지 마세요.
 5. 학생 이름은 전체에서 최대 1회만, 호칭 없이 입력된 이름 그대로 사용하세요. 이름 뒤에 '아'나 '야'를 붙이지 마세요.
 6. '민수아아', '민수야야', '민수야아'처럼 이름이나 호칭이 반복되는 표현을 만들지 마세요.
 
@@ -186,7 +186,7 @@ function postProcessFeedback(feedback: string, name: string): string {
   if (!feedback) return "";
   const fullName = name.trim();
   let cleaned = feedback
-    .replace(/AI|인공지능|마술사|분석가|데이터|알고리즘/gi, "")
+    .replace(/AI|인공지능|마술사|분석가|분석\s*시스템|데이터|알고리즘/gi, "")
     .replace(/[\r\n]+/g, " ")
     .trim();
   if (fullName) {
@@ -206,13 +206,35 @@ function postProcessFeedback(feedback: string, name: string): string {
     if (isHangulSyllable) {
       const hasFinalConsonant = (lastCode - 0xac00) % 28 !== 0;
       const particleCorrections: Record<string, string> = hasFinalConsonant
-        ? { 는: "은", 가: "이", 를: "을", 와: "과" }
-        : { 은: "는", 이: "가", 을: "를", 과: "와" };
+        ? { 는: "은", 가: "이", 를: "을", 와: "과", 랑: "이랑" }
+        : { 은: "는", 이: "가", 을: "를", 과: "와", 이랑: "랑" };
       const incorrectParticles = Object.keys(particleCorrections).join("|");
       cleaned = cleaned.replace(
         new RegExp("(" + escapedName + ")(" + incorrectParticles + ")(?=\\s|[,.!?]|$)", "g"),
         (_match, matchedName, particle: string) => matchedName + particleCorrections[particle]
       );
+    }
+
+    // 일반어/동형어와 충돌 가능한 이름은 의미 왜곡 방지를 위해 후처리 치환을 건너뜀 (원문 보존 우선)
+    const homonymNames = new Set(["하나", "우리", "보람", "사랑", "믿음"]);
+    if (!homonymNames.has(fullName)) {
+      // Match complete name mentions only. Keep the first; use a natural
+      // student-facing pronoun for later mentions and preserve their particles.
+      const nameSuffixes = "처럼|보다|에게|한테|이랑|랑|은|는|이|가|을|를|와|과|의";
+      const nameMention = new RegExp(
+        "(?<![\\p{L}\\p{N}])" + escapedName + "(" + nameSuffixes + ")?(?=$|[^\\p{L}\\p{N}])",
+        "gu"
+      );
+      const secondPersonParticle: Record<string, string> = {
+        은: "는", 는: "는", 을: "를", 를: "를", 와: "와", 과: "와", 이랑: "랑", 랑: "랑"
+      };
+      let occurrenceCount = 0;
+      cleaned = cleaned.replace(nameMention, (match, suffix: string = "") => {
+        occurrenceCount++;
+        if (occurrenceCount === 1) return match;
+        if (suffix === "이" || suffix === "가") return "네가";
+        return "너" + (secondPersonParticle[suffix] ?? suffix);
+      });
     }
   }
 
