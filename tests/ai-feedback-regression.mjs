@@ -344,3 +344,27 @@ test("[Prompt Template 종합 검증] 프롬프트가 문장 수, 교사 어조,
   assert.ok(prompt.includes('"aiFeedback"'));
   assert.ok(prompt.includes('"reportCardDraft"'));
 });
+
+// Repeated names must not leave orphaned particles or fragments in Korean prose.
+const repeatedNameCases = [
+  ["처럼", "민수", "민수는 친구를 잘 도와. 친구들은 민수처럼 배려해.", "민수는 친구를 잘 도와. 친구들은 너처럼 배려해."],
+  ["보다", "민수", "민수는 성실해. 친구들은 민수보다 먼저 준비했어.", "민수는 성실해. 친구들은 너보다 먼저 준비했어."],
+  ["에게", "민수", "민수는 책임감이 있어. 선생님은 민수에게 고마움을 느꼈어.", "민수는 책임감이 있어. 선생님은 너에게 고마움을 느꼈어."],
+  ["한테", "민수", "민수는 배려심이 있어. 친구가 민수한테 도움을 받았어.", "민수는 배려심이 있어. 친구가 너한테 도움을 받았어."],
+  ["의", "민수", "민수는 꾸준해. 민수의 성장을 기대할게.", "민수는 꾸준해. 너의 성장을 기대할게."],
+  ["와 함께", "민수", "민수는 차분해. 민수와 함께 활동한 친구들도 즐거워했어.", "민수는 차분해. 너와 함께 활동한 친구들도 즐거워했어."],
+  ["받침 있는 이름+처럼", "민석", "민석은 친구를 배려해. 친구들도 민석처럼 행동해.", "민석은 친구를 배려해. 친구들도 너처럼 행동해."],
+  ["받침 있는 이름+에게", "지훈", "지훈은 성실해. 선생님은 지훈에게 고마워.", "지훈은 성실해. 선생님은 너에게 고마워."]
+];
+for (const [suffix, name, input, expected] of repeatedNameCases) {
+  test("[이름 중복 문장 보존] " + suffix, () => {
+    const processed = postProcessFeedback(input, name);
+    assert.equal(processed, expected);
+    assert.equal(countOccurrences(processed, name), 1);
+  });
+}
+
+test("[이름 경계] 일반 단어 속 같은 글자를 학생 이름으로 바꾸지 않음", () => {
+  const input = "하나는 성실해. 친구들은 하나씩 준비했어.";
+  assert.equal(postProcessFeedback(input, "하나"), input);
+});

@@ -214,17 +214,23 @@ function postProcessFeedback(feedback: string, name: string): string {
         (_match, matchedName, particle: string) => matchedName + particleCorrections[particle]
       );
     }
-    let occurrenceCount = 0;
-    cleaned = cleaned.replace(
-      new RegExp("(" + escapedName + ")(?:(?:은|는|이|가|의)(?=[\\s,.!?]|$)\\s*|,?\\s*)", "g"),
-      (match) => {
-        occurrenceCount++;
-        if (occurrenceCount === 1) {
-          return match;
-        }
-        return "";
-      }
+    // Match complete name mentions only. Keep the first; use a natural
+    // student-facing pronoun for later mentions and preserve their particles.
+    const nameSuffixes = "처럼|보다|에게|한테|은|는|이|가|을|를|와|과|의";
+    const nameMention = new RegExp(
+      "(?<![\\p{L}\\p{N}])" + escapedName + "(" + nameSuffixes + ")?(?=$|[^\\p{L}\\p{N}])",
+      "gu"
     );
+    const secondPersonParticle: Record<string, string> = {
+      은: "는", 는: "는", 을: "를", 를: "를", 와: "와", 과: "와"
+    };
+    let occurrenceCount = 0;
+    cleaned = cleaned.replace(nameMention, (match, suffix: string = "") => {
+      occurrenceCount++;
+      if (occurrenceCount === 1) return match;
+      if (suffix === "이" || suffix === "가") return "네가";
+      return "너" + (secondPersonParticle[suffix] ?? suffix);
+    });
   }
 
   cleaned = cleaned
