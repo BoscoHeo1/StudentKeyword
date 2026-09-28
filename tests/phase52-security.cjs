@@ -29,7 +29,7 @@ const auth = load("server/teacher-auth.ts");
 const requestLimit = load("server/request-limit.ts");
 const deleted = Symbol("deleted");
 let records = new Map(), writes = 0, reads = 0, broken = false, writeFailure = false, aiCalls = 0;
-let nextId, beforeTransaction, failGeneration = false;
+let nextId, beforeTransaction, beforeCommit, failGeneration = false;
 const copy = x => x === undefined ? undefined : JSON.parse(JSON.stringify(x));
 const snapshot = ref => ({ id: ref.id, ref, exists: records.has(ref.path), data: () => copy(records.get(ref.path)) });
 const ref = (col, id) => ({ id, path: col + "/" + id, get: async () => {
@@ -58,7 +58,10 @@ const database = {
       getAll: async (...refs) => refs.map(snapshot),
       create: (r, data) => {
         if (records.has(r.path)) throw Error("ALREADY_EXISTS");
-        operations.push(() => records.set(r.path, copy(data)));
+        operations.push(() => {
+          if (records.has(r.path)) throw Error("ALREADY_EXISTS");
+          records.set(r.path, copy(data));
+        });
       },
       set: (r, data) => operations.push(() => {
         const value = { ...records.get(r.path), ...data };
@@ -71,6 +74,7 @@ const database = {
       },
       delete: r => operations.push(() => records.delete(r.path))
     });
+    if (beforeCommit) { const f = beforeCommit; beforeCommit = null; f(); }
     operations.forEach(f => { f(); writes++; });
     return result;
   }
@@ -187,8 +191,50 @@ async function main() {
   const cookieA = r.cookieValue;
   r = await call("post", "/api/classes/auth", { body: { classCode: "b", password: "hashed" } });
   assert.equal(r.statusCode, 200); assert.equal(writes, 0);
+  const writesBeforeUnknownLogin = writes;
+  r = await call("post", "/api/classes/auth", { body: { classCode: " NEW ", password: "new" } });
+  assert.equal(r.statusCode, 404); assert.equal(r.data.code, "CLASS_NOT_FOUND");
+  assert.equal(r.data.classCode, "new"); assert.equal(r.cookieValue, undefined);
+  assert.equal(records.has("classes/new"), false); assert.equal(writes, writesBeforeUnknownLogin);
+  r = await call("post", "/api/classes/auth", {
+    body: { classCode: "new", password: "new", confirmCreate: true }
+  });
+  assert.equal(r.statusCode, 404); assert.equal(records.has("classes/new"), false);
+  for (const body of [{ classCode: "new", password: "new" },
+    { classCode: "new", password: "new", confirmCreate: "true" },
+    { classCode: "new", password: "new", confirmCreate: false }]) {
+    r = await call("post", "/api/classes/create", { body });
+    assert.equal(r.statusCode, 400); assert.equal(records.has("classes/new"), false);
+  }
+  r = await call("post", "/api/classes/create", {
+    origin: null, body: { classCode: "new", password: "new", confirmCreate: true }
+  });
+  assert.equal(r.statusCode, 403); assert.equal(records.has("classes/new"), false);
+  r = await call("post", "/api/classes/create", { body: { classCode: " NEW ", password: "new", confirmCreate: true } });
+  assert.equal(r.statusCode, 201); assert.equal(r.data.isNew, true);
+  assert.equal(r.data.classCode, "new"); assert.ok(r.cookieValue);
+  assert.equal("password" in records.get("classes/new"), false);
+  assert.ok(records.get("classes/new").passwordHash.startsWith("scrypt-v1$"));
+  assert.equal(records.get("classes/new").authVersion, 1);
+  assert.equal((await call("get", "/api/classes/session", { token: r.cookieValue })).statusCode, 200);
+  const newClass = copy(records.get("classes/new"));
+  r = await call("post", "/api/classes/create", { body: { classCode: "new", password: "other", confirmCreate: true } });
+  assert.equal(r.statusCode, 409); assert.equal(r.data.code, "CLASS_ALREADY_EXISTS");
+  assert.deepEqual(records.get("classes/new"), newClass); assert.equal(r.cookieValue, undefined);
+  beforeTransaction = () => records.set("classes/race", { passwordHash: "winner", authVersion: 4, createdAt: "other" });
+  r = await call("post", "/api/classes/create", { body: { classCode: "race", password: "loser", confirmCreate: true } });
+  assert.equal(r.statusCode, 409); assert.equal(records.get("classes/race").passwordHash, "winner");
+  assert.equal(r.cookieValue, undefined);
+  beforeCommit = () => records.set("classes/commit-race", { passwordHash: "winner", authVersion: 7, createdAt: "other" });
+  r = await call("post", "/api/classes/create", { body: { classCode: "commit-race", password: "loser", confirmCreate: true } });
+  assert.equal(r.statusCode, 409); assert.equal(records.get("classes/commit-race").passwordHash, "winner");
+  assert.equal(r.cookieValue, undefined);
+  writeFailure = true;
+  r = await call("post", "/api/classes/create", { body: { classCode: "unavailable", password: "new", confirmCreate: true } });
+  assert.equal(r.statusCode, 503); assert.equal(records.has("classes/unavailable"), false);
+  writeFailure = false;
   r = await call("post", "/api/classes/auth", { body: { classCode: "new", password: "new" } });
-  assert.equal(r.data.isNew, true); assert.equal("password" in records.get("classes/new"), false);
+  assert.equal(r.statusCode, 200); assert.equal(r.data.isNew, false);
   r = await call("post", "/api/classes/update-password", { token: cookieA, body: { classCode: "b", oldPassword: "old", newPassword: "changed" } });
   assert.equal(r.statusCode, 200); assert.equal(records.get("classes/a").createdAt, "original");
   assert.equal("password" in records.get("classes/a"), false); assert.equal(records.get("classes/a").authVersion, 1);
@@ -314,6 +360,6 @@ async function main() {
   }
   response = { ok: true, json: async () => ({ success: true, submission: saved }) };
   await front.submit(); assert.equal(step, "success"); assert.equal(succeeded, 1);
-  console.log("PASS: initialization/fail-closed including Cloud Run ADC branch, Hosting session/origin behavior, legacy/hash/new-class auth, session version, validation/injection, UUID/create collision, no fallback, teacher permissions, config closure, API no-store policy, PORT resolution, student UI failure/success flows, regex-special names and safe processing-error response.");
+  console.log("PASS: initialization/fail-closed including Cloud Run ADC branch, Hosting session/origin behavior, explicit new-class confirmation and race handling, legacy/hash auth, session version, validation/injection, UUID/create collision, no fallback, teacher permissions, config closure, API no-store policy, PORT resolution, student UI failure/success flows, regex-special names and safe processing-error response.");
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

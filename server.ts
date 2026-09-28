@@ -467,7 +467,7 @@ app.post("/api/classes/logout", requireTeacherOrigin, (_req, res) => {
   res.json({ success: true });
 });
 
-// API: Authenticate class (Login or Auto-Register)
+// API: Authenticate an existing class. Creation requires a separate, explicit request.
 app.post("/api/classes/auth", requireTeacherOrigin, teacherConfiguration, teacherRateLimit, async (req, res) => {
   const { classCode, password } = req.body || {};
   if (typeof classCode !== "string" || !classCode.trim()
@@ -484,13 +484,38 @@ app.post("/api/classes/auth", requireTeacherOrigin, teacherConfiguration, teache
       issueTeacherCookie(res, existingClass.classCode, existingClass.authVersion ?? 0);
       res.json({ success: true, isNew: false, classCode: existingClass.classCode, message: "로그인에 성공했습니다." });
     } else {
-      const created = await saveClassAsync(trimmedCode, password, true);
-      issueTeacherCookie(res, created.classCode, created.authVersion ?? 0);
-      res.json({ success: true, isNew: true, classCode: created.classCode, message: "새로운 학급 대시보드가 성공적으로 개설되었습니다!" });
+      res.status(404).json({ success: false, code: "CLASS_NOT_FOUND", classCode: trimmedCode,
+        message: "등록되지 않은 학급 코드입니다." });
     }
   } catch {
     res.status(503).json({ success: false, message: "로그인 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요." });
   }
+});
+
+// Called only after the teacher confirms creation in the UI. The transaction's
+// create-only write prevents a concurrent request from replacing a class.
+app.post("/api/classes/create", requireTeacherOrigin, teacherConfiguration, teacherRateLimit, async (req, res) => {
+  const { classCode, password, confirmCreate } = req.body || {};
+  if (typeof classCode !== "string" || !classCode.trim()
+    || typeof password !== "string" || !password.trim() || confirmCreate !== true) {
+    res.status(400).json({ success: false, message: "학급 코드, 비밀번호와 생성 확인을 올바르게 입력해주세요." }); return;
+  }
+  const trimmedCode = classCode.toLowerCase().trim();
+  let created: ClassConfig;
+  try {
+    created = await saveClassAsync(trimmedCode, password, true);
+  } catch {
+    try {
+      if (await getClassAsync(trimmedCode)) {
+        res.status(409).json({ success: false, code: "CLASS_ALREADY_EXISTS",
+          message: "그 사이 학급 코드가 등록되었습니다. 기존 학급으로 로그인해주세요." }); return;
+      }
+    } catch { /* Preserve the original service error. */ }
+    res.status(503).json({ success: false, message: "학급을 생성하지 못했습니다. 잠시 후 다시 시도해주세요." }); return;
+  }
+  issueTeacherCookie(res, created.classCode, created.authVersion ?? 0);
+  res.status(201).json({ success: true, isNew: true, classCode: created.classCode,
+    message: "새로운 학급 대시보드가 성공적으로 개설되었습니다!" });
 });
 
 async function changeTeacherPassword(req: express.Request, res: express.Response) {

@@ -96,7 +96,7 @@ export function teacherRateLimit(req: Request, res: Response, next: NextFunction
   // No untrusted forwarded headers. A proxy may share this budget across users.
   const peer = req.socket.remoteAddress || "unknown";
   const session = readTeacherSession(req);
-  const code = req.path === "/api/classes/auth" ? req.body?.classCode : session?.classCode;
+  const code = ["/api/classes/auth", "/api/classes/create"].includes(req.path) ? req.body?.classCode : session?.classCode;
   const now = Date.now();
   const peerAllowed = consume("peer:" + peer, 60, now);
   const classAllowed = typeof code !== "string" || consume("class:" + code.trim().toLowerCase(), 10, now);

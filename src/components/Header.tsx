@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { Shield, GraduationCap, LayoutDashboard } from "lucide-react";
 
 interface HeaderProps {
@@ -11,6 +11,10 @@ export default function Header({ currentMode, onChangeMode }: HeaderProps) {
   const [classCodeInput, setClassCodeInput] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
+  const [pendingClassCode, setPendingClassCode] = useState<string | null>(null);
+  const [creationError, setCreationError] = useState("");
+  const [creatingClass, setCreatingClass] = useState(false);
+  const creatingRef = useRef(false);
 
   const [activeClassCode, setActiveClassCode] = useState<string | null>(null);
 
@@ -19,6 +23,8 @@ export default function Header({ currentMode, onChangeMode }: HeaderProps) {
     setActiveClassCode(null);
     onChangeMode("student");
     setShowPasswordModal(true);
+    setPendingClassCode(null);
+    setCreationError("");
     setPassword("");
     setError("");
   };
@@ -106,12 +112,49 @@ export default function Header({ currentMode, onChangeMode }: HeaderProps) {
         setPassword("");
         setShowPasswordModal(false);
         onChangeMode("teacher");
+      } else if (res.status === 404 && data.code === "CLASS_NOT_FOUND") {
+        setPendingClassCode(data.classCode || classCodeInput.trim().toLowerCase());
+        setCreationError("");
+        setShowPasswordModal(false);
       } else {
         setError(data.message || "비밀번호가 일치하지 않습니다.");
       }
     } catch (err) {
       console.error("Auth error", err);
       setError("서버와의 연결에 실패했습니다.");
+    }
+  };
+
+  const handleCreateClass = async () => {
+    if (!pendingClassCode || creatingRef.current) return;
+    creatingRef.current = true;
+    setCreatingClass(true);
+    setCreationError("");
+    try {
+      const res = await fetch("/api/classes/create", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ classCode: pendingClassCode, password: password.trim(), confirmCreate: true })
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        localStorage.setItem("teacher_class_code", data.classCode);
+        setActiveClassCode(data.classCode);
+        setPassword("");
+        setPendingClassCode(null);
+        onChangeMode("teacher");
+      } else if (res.status === 409 && data.code === "CLASS_ALREADY_EXISTS") {
+        setPendingClassCode(null);
+        setShowPasswordModal(true);
+        setError(data.message);
+      } else {
+        setCreationError(data.message || "학급을 생성하지 못했습니다. 다시 시도해주세요.");
+      }
+    } catch {
+      setCreationError("서버와의 연결에 실패했습니다.");
+    } finally {
+      creatingRef.current = false;
+      setCreatingClass(false);
     }
   };
 
@@ -206,8 +249,8 @@ export default function Header({ currentMode, onChangeMode }: HeaderProps) {
                   선생님 고유의 학급 코드를 개설하거나 기존 대시보드로 로그인할 수 있습니다.
                 </p>
                 <p className="text-[10px] text-indigo-500 bg-indigo-50/50 px-2.5 py-1 rounded-lg mt-2 inline-block leading-relaxed" id="password-hint">
-                  개설된 적 없는 새로운 학급 코드를 입력하시면<br/>
-                  입력하신 비밀번호로 <strong className="font-bold">신규 대시보드가 자동 생성</strong>됩니다!
+                  개설된 적 없는 학급 코드를 입력하시면<br/>
+                  확인 후 입력하신 비밀번호로 <strong className="font-bold">신규 대시보드를 생성</strong>할 수 있습니다.
                 </p>
               </div>
 
@@ -264,6 +307,32 @@ export default function Header({ currentMode, onChangeMode }: HeaderProps) {
                   </button>
                 </div>
               </form>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {pendingClassCode && (
+        <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4 z-50" id="create-class-modal-overlay">
+          <div className="bg-white rounded-3xl max-w-sm w-full p-6 shadow-2xl border border-gray-100 text-center space-y-4" role="dialog" aria-modal="true" aria-labelledby="create-class-title">
+            <h3 className="text-lg font-bold text-gray-800" id="create-class-title">새 학급으로 생성할까요?</h3>
+            <p className="text-sm text-slate-600">
+              <strong className="text-indigo-700 break-all">{pendingClassCode}</strong> 코드는 아직 등록되지 않았습니다.
+              코드를 확인한 뒤 새 학급을 생성해주세요.
+            </p>
+            {creationError && <p className="text-xs text-rose-600 font-semibold" role="alert">{creationError}</p>}
+            <div className="flex gap-2 pt-2">
+              <button type="button" disabled={creatingClass} onClick={() => {
+                setPendingClassCode(null);
+                setCreationError("");
+                setShowPasswordModal(true);
+              }} className="flex-1 py-3 bg-gray-50 hover:bg-gray-100 text-gray-600 rounded-xl text-sm font-semibold disabled:opacity-50">
+                코드 수정
+              </button>
+              <button type="button" disabled={creatingClass} onClick={handleCreateClass}
+                className="flex-1 py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-semibold disabled:opacity-50">
+                {creatingClass ? "생성 중..." : "새 학급 생성"}
+              </button>
             </div>
           </div>
         </div>
