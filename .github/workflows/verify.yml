@@ -35,6 +35,8 @@ jobs:
         run: node --test tests/ai-feedback-regression.mjs
       - name: Request limit regression
         run: node --test tests/request-limit.mjs
+      - name: Deployment safety regression (mock GCP commands only)
+        run: node --test tests/deployment-regression.mjs
 
   secret-scan:
     name: Gitleaks

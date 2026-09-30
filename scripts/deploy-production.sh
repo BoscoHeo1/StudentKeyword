@@ -19,7 +19,12 @@ image_root=asia-northeast3-docker.pkg.dev/mykeyword-a832f/studentkeyword/student
 before="$(mktemp)"
 after="$(mktemp)"
 build_record="$(mktemp)"
-trap 'rm -f "$before" "$after" "$build_record"' EXIT
+revision_record="$(mktemp)"
+registry_error="$(mktemp)"
+registry_tags="$(mktemp)"
+traffic_record="$(mktemp)"
+authorization="$(mktemp)"
+trap 'rm -f "$before" "$after" "$build_record" "$revision_record" "$registry_error" "$registry_tags" "$traffic_record" "$authorization"' EXIT
 
 gcloud run services describe "$service" --project="$project" --region="$region" --format=json > "$before"
 old_revision="$(jq -er '[.status.traffic[] | select(.percent == 100) | .revisionName] | if length == 1 then .[0] else error("Expected exactly one 100% production revision") end' "$before")"
@@ -37,10 +42,23 @@ fi
 [[ "${GITHUB_RUN_ID:-}" =~ ^[0-9]+$ && "${GITHUB_RUN_ATTEMPT:-}" =~ ^[0-9]+$ ]]
 tag="sha-${GITHUB_SHA}-r${GITHUB_RUN_ID}-a${GITHUB_RUN_ATTEMPT}"
 image_tag="$image_root:$tag"
-if gcloud artifacts docker images describe "$image_tag" --project="$project" --format='value(image_summary.digest)' >/dev/null 2>&1; then
+if gcloud artifacts docker images describe "$image_tag" --project="$project" --format='value(image_summary.digest)' >/dev/null 2>"$registry_error"; then
   echo "Image tag already exists: $image_tag" >&2
   exit 1
+elif ! grep -Eq '^ERROR: \(gcloud\.artifacts\.docker\.images\.describe\) (NOT_FOUND:|Image not found\.$)' "$registry_error"; then
+  echo 'Artifact Registry lookup failed; refusing to build.' >&2
+  cat "$registry_error" >&2
+  exit 1
 fi
+# A missing/inaccessible repository is not an absent image tag.
+gcloud artifacts repositories describe studentkeyword --project="$project" --location="$region" --format='value(name)' >/dev/null
+# Confirm absence through a successful API listing, not just CLI error text.
+gcloud artifacts docker tags list "$image_root" --project="$project" --format=json > "$registry_tags"
+jq -e --arg tag "$tag" --arg image "$image_root"   'type == "array" and all(.[]; .image == $image and (.tag | type == "string")) and
+   all(.[]; (.tag | split("/") | last) != $tag)' "$registry_tags" >/dev/null || {
+  echo 'Image tag exists or tag absence could not be verified; refusing to build.' >&2
+  exit 1
+}
 
 gcloud builds submit --project="$project" --region="$region" --no-source \
   --config=cloudbuild.production.yaml \
@@ -73,16 +91,32 @@ gcloud run services describe "$service" --project="$project" --region="$region" 
 [[ "$(jq -er '[.status.traffic[] | select(.percent == 100) | .revisionName] | .[0]' "$after")" == "$old_revision" ]]
 
 preview_tag="p${GITHUB_SHA:0:12}r${GITHUB_RUN_ID}a${GITHUB_RUN_ATTEMPT}"
+new_revision="$service-$preview_tag"
 gcloud run deploy "$service" --project="$project" --region="$region" \
-  --image="$image_digest" --no-traffic --tag="$preview_tag" --quiet
-gcloud run services describe "$service" --project="$project" --region="$region" --format=json > "$after"
-new_revision="$(jq -er '.status.latestCreatedRevisionName' "$after")"
-[[ "$new_revision" != "$old_revision" ]]
-[[ "$(jq -er '[.status.traffic[] | select(.percent == 100) | .revisionName] | .[0]' "$after")" == "$old_revision" ]]
-[[ "$(jq -c '.spec.template.spec | .containers[0].image = ""' "$before")" == "$(jq -c '.spec.template.spec | .containers[0].image = ""' "$after")" ]] || {
-  echo 'Runtime settings differ from the previous revision; traffic unchanged.' >&2
-  exit 1
+  --image="$image_digest" --revision-suffix="$preview_tag" --no-traffic --tag="$preview_tag" --quiet
+
+verify_candidate() {
+  gcloud run services describe "$service" --project="$project" --region="$region" --format=json > "$after"
+  jq -e --arg old "$old_revision" --arg revision "$new_revision" --arg tag "$preview_tag" \
+    '([.status.traffic[] | select(.percent == 100) | .revisionName] == [$old]) and
+     (.status.latestCreatedRevisionName == $revision) and
+     ([.status.traffic[] | select(.tag == $tag) | .revisionName] == [$revision])' "$after" >/dev/null || {
+    echo 'Concurrent deployment or candidate/tag/traffic mismatch; refusing promotion.' >&2
+    return 1
+  }
+  gcloud run revisions describe "$new_revision" --project="$project" --region="$region" --format=json > "$revision_record"
+  jq -e --arg revision "$new_revision" --arg image "$image_digest" --arg digest "$digest" \
+    '(.metadata.name == $revision) and (.spec.containers[0].image == $image) and
+     ((.status.imageDigest // $image) == $image or .status.imageDigest == $digest)' "$revision_record" >/dev/null || {
+    echo 'Candidate revision does not match the built image digest.' >&2
+    return 1
+  }
+  [[ "$(jq -c '.spec.template.spec | .containers[0].image = ""' "$before")" == "$(jq -c '.spec.template.spec | .containers[0].image = ""' "$after")" ]] || {
+    echo 'Runtime settings differ from the previous revision; refusing promotion.' >&2
+    return 1
+  }
 }
+verify_candidate
 
 ready=false
 for _ in {1..30}; do
@@ -115,15 +149,58 @@ smoke() {
 
 smoke "$preview_url"
 echo "Preview smoke passed: $new_revision"
+# Recheck after smoke: a concurrent revision must not be promoted or overwritten.
+verify_candidate
+[[ "$(jq -er --arg tag "$preview_tag" '[.status.traffic[] | select(.tag == $tag) | .url] | .[0]' "$after")" == "$preview_url" ]]
+
+# Carry the last verified resourceVersion into the API update. A concurrent
+# change between verification and this request is rejected, never overwritten.
+jq -e '.metadata.resourceVersion | type == "string" and length > 0' "$after" >/dev/null
+jq --arg revision "$new_revision" '{apiVersion, kind,
+  metadata: (.metadata | {name, namespace, resourceVersion, labels, annotations}),
+  spec: (.spec + {traffic: ([{revisionName: $revision, percent: 100}] +
+    [.status.traffic[] | select(.tag != null) | {revisionName, tag, percent: 0}])})}' "$after" > "$traffic_record"
+access_token="$(gcloud auth print-access-token)"
+printf 'Authorization: Bearer %s\n' "$access_token" > "$authorization"
+unset access_token
+if ! curl --silent --show-error --fail --max-time 60 -X PUT \
+  -H "@$authorization" -H 'Content-Type: application/json' --data-binary "@$traffic_record" \
+  --output /dev/null "https://$region-run.googleapis.com/apis/serving.knative.dev/v1/namespaces/$project/services/$service"; then
+  echo 'Promotion rejected or not confirmed; deployment failed. Inspect current traffic before manual recovery.' >&2
+  exit 1
+fi
 
 rollback_on_error() {
+  local failure_status=$?
+  trap - ERR
   echo "Post-switch failure; restoring $old_revision to 100% traffic." >&2
-  gcloud run services update-traffic "$service" --project="$project" --region="$region" \
-    --to-revisions="$old_revision=100" --quiet || true
+  if ! gcloud run services update-traffic "$service" --project="$project" --region="$region" \
+    --to-revisions="$old_revision=100" --quiet; then
+    echo 'ROLLBACK FAILED: traffic update failed; manual recovery required.' >&2
+    exit 1
+  fi
+  if ! gcloud run services describe "$service" --project="$project" --region="$region" --format=json > "$after"; then
+    echo 'ROLLBACK FAILED: could not verify production traffic; manual recovery required.' >&2
+    exit 1
+  fi
+  if ! jq -e --arg old "$old_revision" '[.status.traffic[] | select(.percent == 100) | .revisionName] == [$old]' "$after" >/dev/null; then
+    echo 'ROLLBACK FAILED: previous revision is not at 100%; manual recovery required.' >&2
+    exit 1
+  fi
+  echo "Rollback verified: $old_revision (100%). Deployment remains failed." >&2
+  exit "$failure_status"
 }
 trap rollback_on_error ERR
-gcloud run services update-traffic "$service" --project="$project" --region="$region" \
-  --to-revisions="$new_revision=100" --quiet
+promoted=false
+for _ in {1..30}; do
+  gcloud run services describe "$service" --project="$project" --region="$region" --format=json > "$after"
+  [[ "$(jq -er '.status.latestCreatedRevisionName' "$after")" == "$new_revision" ]]
+  if jq -e --arg revision "$new_revision" \
+    '([.status.traffic[] | select(.percent == 100) | .revisionName] == [$revision]) and
+     (.metadata.generation == .status.observedGeneration)' "$after" >/dev/null; then promoted=true; break; fi
+  sleep 10
+done
+[[ "$promoted" == true ]]
 smoke "$service_url"
 gcloud run services describe "$service" --project="$project" --region="$region" --format=json > "$after"
 [[ "$(jq -er '[.status.traffic[] | select(.percent == 100) | .revisionName] | .[0]' "$after")" == "$new_revision" ]]

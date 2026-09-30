@@ -9,9 +9,9 @@ The workflow uses GitHub OIDC to impersonate a dedicated deploy service account.
 | `GCP_DEPLOY_WIF_PROVIDER` | `projects/783209447753/locations/global/workloadIdentityPools/studentkeyword-github/providers/github-main-deploy` |
 | `GCP_DEPLOY_SERVICE_ACCOUNT` | `studentkeyword-deploy@mykeyword-a832f.iam.gserviceaccount.com` |
 
-## GCP setup to review before applying
+## Existing GCP setup
 
-The project currently has no Workload Identity Federation pool and no dedicated build or deploy account. Create only these resources and bindings after checking the current IAM policy:
+The WIF pool `studentkeyword-github`, provider `github-main-deploy`, deploy account `studentkeyword-deploy@mykeyword-a832f.iam.gserviceaccount.com`, and build account `studentkeyword-build@mykeyword-a832f.iam.gserviceaccount.com` already exist. The following scoped IAM bindings have already been connected and verified. Reuse them; do not recreate these resources or reapply IAM as part of a deployment.
 
 | Resource or binding | Role and scope | Purpose |
 | --- | --- | --- |
@@ -33,9 +33,11 @@ To undo this setup, remove the deploy account's service, registry, build, and se
 1. Checks that the selected commit is the current public `main` and its `Verify source` workflow succeeded.
 2. Uses a keyless token and checks current production configuration. `validate` stops here without a build.
 3. For `deploy`, Cloud Build clones public `main`, verifies its exact SHA, and builds `sha-<full SHA>-r<run ID>-a<attempt>` in the existing Artifact Registry repository. A duplicate tag fails closed. The build ID and image digest are logged.
-4. Deploys the image **by digest** with `--no-traffic`, verifies the old revision still has 100% traffic, checks the new revision is Ready, and compares runtime service account and container settings to the previous revision.
+4. Deploys the image **by digest** with `--no-traffic` and a unique revision suffix derived from the source SHA and workflow run/attempt. Verifies the exact revision name, built digest, preview tag, old 100% traffic, and runtime settings. A different latest revision is treated as concurrent deployment and stops promotion; it is never selected as the candidate. Repeats these checks after candidate smoke.
 5. Performs read-only HTTP checks against the tagged candidate: `/` 200, `/api/config` 410, unauthenticated `/api/classes/session` 401, logout without Origin 403, and logout with the allowed Hosting Origin 200. Logout clears only the request's empty cookie; it does not touch student data.
-6. Switches traffic to the new revision, repeats the checks, and attempts to restore the old revision to 100% if a post-switch step fails. Old revisions are retained.
+6. Switches traffic to the verified revision using the Cloud Run v1 API and the last checked `metadata.resourceVersion` for optimistic concurrency control. A change between verification and promotion is rejected rather than overwritten. Waits for the traffic generation to reconcile, repeats smoke checks, and restores the old revision if a post-switch step fails. Rollback is successful only after a fresh service query confirms the old revision actually has 100% traffic. A failed rollback command, query, or traffic verification reports `ROLLBACK FAILED` and requires manual recovery; the deployment always remains failed. An unsuccessful/ambiguous promotion API request also fails and requires inspecting traffic before manual recovery. Old revisions are retained. See [Cloud Run conditional updates](https://cloud.google.com/run/docs/reference/rest/v1/namespaces.services/replaceService).
+
+The image lookup stops on existing tags or unexpected authentication, permission, API, and network errors. A recognized `NOT_FOUND` or CLI `Image not found.` response is only a candidate absence: the repository must still be readable and a successful tag-list API response must prove the target tag is absent before a build starts. Failed listings, malformed responses, tags that appear during lookup, and unknown error formats fail closed. `node --test tests/deployment-regression.mjs` exercises the real deployment script with isolated mock `gcloud`, `curl`, and `git` executables; it never calls production.
 
 The workflow does not deploy Firebase Hosting or Firestore Rules, change IAM or secrets, run a database migration, or use Gemini. It does not create, modify, or delete student data.
 
