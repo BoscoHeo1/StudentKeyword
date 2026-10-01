@@ -2,7 +2,9 @@
 
 ## Scope and current state
 
-This change is based directly on main `d62c002fb2c0a58617bb770a3ff70c9f15b795d1`.
+The original Phase 3D change was based on main `d62c002fb2c0a58617bb770a3ff70c9f15b795d1`.
+PR #7 is now merged. The diagnostics follow-up starts from main
+`6e1b51dc4a5b7cac965055a4b84c38fdf84a7b22` and does not authorize a deployment.
 PR #6 / `phase3c-deployment-automation` remains independent and Cloud Run only.
 Neither PR is merged by this automation. No Hosting, Cloud Run, IAM, WIF,
 Secret, Rules or student data changes were performed to implement this PR.
@@ -71,7 +73,56 @@ permission checks and the JSON deployment version result. Future upgrades must
 repeat that review and the mock regressions. CLI installation/version checks
 do not perform a production deploy.
 
-## Identity and minimum IAM proposal — NOT APPLIED
+## Safe failure diagnostics
+
+Firebase CLI 15.32.0 `lib/command.js` writes a JSON object with `status: "error"`
+and `error: err.message` on action failure. A structured
+context/body is not guaranteed in that output. Startup failures or stderr may
+be non-JSON. The sanitizer accepts both that actual shape and nested error,
+context/body JSON, with bounded parsing and conservative text fact extraction.
+
+Child stdout/stderr are explicitly piped. `HostingCliError` retains only an
+allowlisted diagnosis, with no raw output, cause, child stack or command dump.
+Allowed facts: HTTP error status, recognized Google/network error codes,
+known permissions, this site's resource names, known API host/path without
+query/userinfo, and normalized CLI message fragments. Arbitrary message text,
+environment dumps, credentials, private keys, API keys, tokens, authorization
+headers and local credential paths never become log or diagnosis fields.
+Unknown messages remain `raw output withheld`; this deliberately trades some
+detail for safety. No full debug log or credential file is uploaded.
+
+`cli-start.json` records a read-only live/version snapshot before the command.
+On CLI failure, `cli-failure.json` records sanitized diagnosis and a subsequent
+GET-only snapshot, bounded version-list completeness and newly observed
+versions. These differences do not establish ownership under concurrent
+deployments. Missing/truncated/read-denied observations are explicit, preserve
+the CLI failure and do not trigger rollback. Internal CLI stage stays `unknown`.
+After CLI success, wrapper stage `post-deploy-verify` precedes the unchanged
+ownership/history/hash checks and existing guarded rollback behavior.
+Release evidence preserves only SHA/run/attempt messages; arbitrary old or
+foreign release messages are withheld.
+
+The first publish attempt (run `36803521894`, attempt 1) failed in the CLI.
+Its wrapper discarded the raw error, so that cause cannot be recovered from
+the wrapper log. A read-only inspection on 2026-10-01 found version
+`1542108060035189` still CREATED, empty config, no finalize time or release,
+and five ACTIVE file records (HTML, JS, CSS and two reserved init files).
+File records are evidence of population, not proof of the exact failed command
+or its permission. Live remains release `1790142455605000`, version
+`255f0b036e92c215`. Do not infer missing IAM from this alone or delete the orphan.
+
+Next: review/merge this diagnostics PR separately, verify main CI, then obtain
+separate approval before any one-shot Hosting-only retry. Keep the deploy gate
+false until that approval. The diagnostics patch neither dispatches nor deploys.
+
+## Identity and minimum IAM proposal — original PR #7 design
+
+The following proposal is retained for design history. The dedicated Hosting
+SA/provider and custom roles `studentkeywordHostingReadOnly` (sites.get/list,
+firebase.projects.get) and `studentkeywordHostingDeploy` (sites.update only)
+were subsequently applied. `HOSTING_DEPLOY_ENABLED` is currently false.
+The diagnostics follow-up does not alter IAM/WIF or prove write permissions
+sufficient for a complete publish; the first CLI failure is still unexplained.
 
 Proposed dedicated identity:
 `studentkeyword-hosting-deploy@mykeyword-a832f.iam.gserviceaccount.com`.

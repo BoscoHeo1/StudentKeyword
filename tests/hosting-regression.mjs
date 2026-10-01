@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync, chmodSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -8,6 +9,7 @@ import {
   artifactManifest, validateLive, hash,
 } from '../scripts/hosting-safety.mjs';
 import { runHosting, realAdapter, sanitizeEvidence } from '../scripts/deploy-hosting.mjs';
+import { HostingCliError, sanitizeCliFailure, versionObservation } from '../scripts/hosting-diagnostics.mjs';
 
 const config = JSON.parse(readFileSync(new URL('../firebase.json', import.meta.url)));
 const rc = JSON.parse(readFileSync(new URL('../.firebaserc', import.meta.url)));
@@ -158,7 +160,7 @@ test('concurrent deployment during build blocks publish', async () => {
 });
 test('CLI failure never reports success or restores over an unknown release', async () => {
   const f = fixture(); f.adapter.deploy = () => { throw new Error('CLI failed'); };
-  await assert.rejects(f.execute(), /CLI failed/); assert(!f.calls.includes('rollback'));
+  await assert.rejects(f.execute(), /Firebase CLI deploy failed/); assert(!f.calls.includes('rollback'));
 });
 test('release message mismatch fails without overwriting foreign release', async () => {
   const f = fixture(); const deploy = f.adapter.deploy;
@@ -282,4 +284,130 @@ test('Hosting site lookup accepts the canonical project number but rejects other
     if (project === '783209447753') await adapter.project();
     else await assert.rejects(adapter.project(), /unexpected Hosting project/);
   }
+});
+
+const sensitive = [
+  'ya29.' + 'fixtureAccessValue', 'eyJfixture' + '.fixturePayload.fixtureSignature',
+  'ghp_' + 'fixtureGithubValue', 'github_pat_' + 'fixtureGithubValue',
+  'AIza' + 'fixtureApiKeyValue', '/runner/private/credential-file.json',
+  'fixtureRefreshValue', 'fixturePrivateKeyValue', 'fixtureOpaqueValue',
+];
+function noSecrets(value) {
+  const serialized = JSON.stringify(value);
+  for (const secret of sensitive) assert(!serialized.includes(secret), `sensitive fixture escaped sanitizer`);
+  assert(!serialized.includes('PRIVATE KEY'));
+}
+
+test('CLI JSON 403 preserves permission/status/code but discards token', () => {
+  const d = sanitizeCliFailure({ status: 2, stdout: JSON.stringify({ status: 'error', error:
+    `HTTP 403 PERMISSION_DENIED: Permission firebasehosting.sites.update denied. Bearer ${sensitive[0]}` }) });
+  assert.deepEqual(d.httpStatus, [403]); assert.deepEqual(d.permissions, ['firebasehosting.sites.update']);
+  assert.deepEqual(d.codes, ['PERMISSION_DENIED']); assert.equal(d.cliStatus, 'error');
+  assert.equal(d.exitCode, 2); assert.equal(d.parsedJson, true); noSecrets(d);
+});
+test('nested error/context/body JSON keeps only diagnostic facts', () => {
+  const d = sanitizeCliFailure({ stdout: JSON.stringify({ status: 'error', error: { context: { body: JSON.stringify({
+    error: { code: 403, status: 'PERMISSION_DENIED', message: 'firebasehosting.sites.update',
+      details: [{ permission: 'firebase.projects.get', resource: `sites/${SITE}/versions/123` }],
+      credentials: { private_key: sensitive[7] }, env: { SECRET: sensitive[8] } } }) } } }) });
+  assert.deepEqual(d.httpStatus, [403]); assert.deepEqual(d.resources, [`sites/${SITE}/versions/123`]);
+  assert(d.permissions.includes('firebase.projects.get')); noSecrets(d);
+});
+test('non-JSON stderr extracts safe lines without dumping unknown lines', () => {
+  const d = sanitizeCliFailure({ stderr: `noise ${sensitive[8]}\nHTTP 403 PERMISSION_DENIED\nfirebasehosting.sites.update\nBearer ${sensitive[0]}` });
+  assert.equal(d.parsedJson, false); assert.deepEqual(d.httpStatus, [403]); noSecrets(d);
+});
+for (const [label, raw] of [
+  ['API key', `HTTP 403 https://firebasehosting.googleapis.com/v1beta1/sites/${SITE}/versions/123?key=${sensitive[4]}`],
+  ['bearer/access/OIDC/GitHub tokens', sensitive.slice(0, 5).map((v) => `Bearer ${v}`).join('\n')],
+  ['credential path and environment dump', `GOOGLE_APPLICATION_CREDENTIALS=${sensitive[5]}\nenv={SECRET:${sensitive[8]}}`],
+  ['credential JSON/private key/refresh token', JSON.stringify({ type: 'service_account', private_key:
+    '-----BEGIN ' + 'PRIVATE KEY-----\n' + sensitive[7] + '\n-----END ' + 'PRIVATE KEY-----', refresh_token: sensitive[6] })],
+]) test(`sanitizer withholds ${label}`, () => {
+  const d = sanitizeCliFailure({ stderr: raw }); noSecrets(d); assert.equal(d.rawOutputWithheld, true);
+});
+test('endpoint output excludes query/auth data and unknown hosts/paths', () => {
+  const d = sanitizeCliFailure({ message: `Request to https://firebasehosting.googleapis.com/v1beta1/sites/${SITE}/versions/123?key=${sensitive[4]} had HTTP 403\nhttps://unknown.invalid/${sensitive[8]}\nhttps://firebasehosting.googleapis.com/private/${sensitive[8]}` });
+  assert.deepEqual(d.endpoints, [`firebasehosting.googleapis.com/v1beta1/sites/${SITE}/versions/123`]); noSecrets(d);
+});
+test('unknown errors and malformed JSON never return raw text/stack', () => {
+  for (const raw of ['{broken ' + sensitive[8], sensitive[8]]) {
+    const d = sanitizeCliFailure({ message: raw, stderr: raw, stack: raw });
+    assert.equal(d.message, 'Unrecognized CLI error; raw output withheld'); noSecrets(d);
+  }
+});
+test('CLI error object does not retain raw output or cause', () => {
+  const error = new HostingCliError({ stderr: `HTTP 403 ${sensitive[0]}`, stdout: sensitive[8] });
+  assert(!('stdout' in error)); assert(!('stderr' in error)); assert(!('cause' in error));
+  noSecrets({ message: error.message, diagnosis: error.diagnosis });
+});
+test('real child-process stderr is piped rather than echoed before sanitizing', { skip: process.platform === 'win32' }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'studentkeyword-diagnostic-command-'));
+  try {
+    const dir = join(root, 'tools/hosting-cli/node_modules/.bin'); mkdirSync(dir, { recursive: true });
+    const cli = join(dir, 'firebase');
+    writeFileSync(cli, `#!/usr/bin/env node\nif (process.argv[2] === '--version') console.log('${CLI_VERSION}'); else { console.error('Bearer ' + ${JSON.stringify(sensitive[0])}); console.log(JSON.stringify({status:'error',error:'HTTP 403 firebasehosting.sites.update'})); process.exitCode=2; }\n`);
+    chmodSync(cli, 0o700);
+    const module = new URL('../scripts/deploy-hosting.mjs', import.meta.url).href;
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e',
+      `import {realAdapter} from ${JSON.stringify(module)}; try { realAdapter(${JSON.stringify(root)},${JSON.stringify(env)}).deploy(); } catch(e) { console.error(e.message); process.exitCode=1; }`], { encoding: 'utf8' });
+    assert.equal(result.status, 1); assert(result.stderr.includes('firebasehosting.sites.update'));
+    noSecrets({ stdout: result.stdout, stderr: result.stderr });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+test('real adapter sanitizes thrown command output and non-success JSON', () => {
+  for (const mode of ['throws', 'json']) {
+    const adapter = realAdapter('/mock', env, { command: (binary, args) => {
+      if (args[0] === '--version') return CLI_VERSION;
+      const output = JSON.stringify({ status: 'error', error: `HTTP 403 firebasehosting.sites.update Bearer ${sensitive[0]}` });
+      if (mode === 'throws') throw Object.assign(new Error(sensitive[8]), { stdout: output, stderr: sensitive[4], status: 2 });
+      return output;
+    } });
+    assert.throws(() => adapter.deploy(), (e) => {
+      assert(e instanceof HostingCliError); assert.deepEqual(e.diagnosis.httpStatus, [403]); noSecrets(e); return true;
+    });
+  }
+});
+test('CLI failure records before/after observations and sanitized diagnosis with no rollback', async () => {
+  const f = fixture(); let read = 0;
+  f.adapter.diagnosticState = async () => ({ release: f.old, versions: ++read === 1 ? [] :
+    [versionObservation({ name: `sites/${SITE}/versions/orphan`, status: 'CREATED', labels: { secret: sensitive[8] } })] });
+  f.adapter.deploy = () => { throw Object.assign(new Error(sensitive[8]), { stdout: JSON.stringify({ status: 'error', error:
+    `HTTP 403 firebasehosting.sites.update Bearer ${sensitive[0]}` }), stderr: sensitive[5] }); };
+  await assert.rejects(f.execute(), /Firebase CLI deploy failed/);
+  assert.equal(read, 2); assert.equal(f.records['cli-start'].stage, 'cli-start');
+  const failure = f.records['cli-failure'];
+  assert.equal(failure.internalCliStage, 'unknown'); assert.equal(failure.newlyObservedVersions[0].status, 'CREATED');
+  assert.equal(failure.comparisonComplete, true); assert(!f.calls.includes('rollback'));
+  noSecrets(sanitizeEvidence(f.records)); assert(!f.records.result);
+});
+test('diagnostic read failure preserves original CLI failure and does not change live', async () => {
+  const f = fixture(); f.adapter.diagnosticState = () => { throw new Error(`HTTP 403 ${sensitive[0]}`); };
+  f.adapter.deploy = () => { throw new Error('PERMISSION_DENIED firebasehosting.sites.update'); };
+  await assert.rejects(f.execute(), /PERMISSION_DENIED/);
+  assert.equal(f.records['cli-failure'].comparisonComplete, false);
+  assert.equal(f.records['cli-failure'].after.unavailable, true); assert(!f.calls.includes('rollback'));
+  noSecrets(sanitizeEvidence(f.records));
+});
+test('concurrent deployment during diagnostic snapshot prevents CLI invocation', async () => {
+  const f = fixture();
+  f.adapter.diagnosticState = async () => { f.setLive(release('foreign', 'v2')); return { versions: [] }; };
+  await assert.rejects(f.execute(), /concurrent Hosting deployment during diagnostic snapshot/);
+  assert(!f.calls.includes('deploy')); assert(!f.calls.includes('rollback'));
+});
+test('diagnostic state uses bounded GETs only, omitting config/users/labels and raw tokens', async () => {
+  const calls = []; const old = release('old', 'v0');
+  const adapter = realAdapter('/mock', env, { command: () => sensitive[0], fetch: async (url, options) => {
+    calls.push({ url, method: options.method }); assert.equal(options.method, 'GET');
+    return { ok: true, json: async () => url.endsWith('/channels/live') ? { release: old } :
+      { versions: [{ name: `sites/${SITE}/versions/orphan`, status: 'CREATED', config: { secret: sensitive[8] },
+        labels: { secret: sensitive[8] }, createUser: { secret: sensitive[8] } }], nextPageToken: 'fixture-page' } };
+  } });
+  const state = await adapter.diagnosticState(); assert.equal(calls.length, 4); assert.equal(state.truncated, true);
+  noSecrets(sanitizeEvidence(state)); assert(!('config' in state.versions[0]));
+});
+test('release evidence never includes arbitrary old/foreign release messages', () => {
+  const cleaned = sanitizeEvidence({ release: release('foreign', 'v2', sensitive[8]), stdout: sensitive[0],
+    GOOGLE_APPLICATION_CREDENTIALS: sensitive[5], env: { SECRET: sensitive[8] } });
+  noSecrets(cleaned); assert.equal(cleaned.release.message, '[withheld]');
 });

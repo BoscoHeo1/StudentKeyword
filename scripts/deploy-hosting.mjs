@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { HostingCliError, sanitizeCliFailure, versionObservation } from './hosting-diagnostics.mjs';
 import {
   PROJECT, SITE, REPOSITORY, CLI_VERSION, HOSTING_SA, hash, assetPaths,
   validateConfig, validateSource, artifactManifest, validateLive,
@@ -16,18 +17,23 @@ export function sanitizeEvidence(value) {
   if (Array.isArray(value)) return value.map(sanitizeEvidence);
   if (!value || typeof value !== 'object') return value;
   if (value.version?.name && typeof value.name === 'string') {
-    return { name: value.name, message: value.message, releaseTime: value.releaseTime,
+    const message = /^(?:rollback )?sha=[a-f0-9]{40} run=\d+ attempt=\d+$/.test(value.message || '') ? value.message : '[withheld]';
+    return { name: value.name, message, releaseTime: value.releaseTime,
       version: { name: value.version.name, status: value.version.status } };
   }
   return Object.fromEntries(Object.entries(value)
-    .filter(([key]) => !['releaseUser', 'createUser', 'finalizeUser', 'deleteUser', 'labels'].includes(key))
+    .filter(([key]) => !['releaseUser', 'createUser', 'finalizeUser', 'deleteUser', 'labels'].includes(key)
+      && !/token|credential|authorization|private.?key|api.?key|^(?:env|environment|stdout|stderr|stack|cause)$/i.test(key))
     .map(([key, item]) => [key, sanitizeEvidence(item)]));
 }
 
 function defaultCommand(binary, args, options = {}) {
   // Never echo command stderr: auth/CLI debug output can contain credentials.
-  try { return execFileSync(binary, args, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, ...options }); }
-  catch { throw new Error(`Command failed: ${binary.split(/[\\/]/).at(-1)} ${args[0] || ''}; raw output withheld`); }
+  try { return execFileSync(binary, args, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, ...options, stdio: ['ignore', 'pipe', 'pipe'] }); }
+  catch (error) {
+    if (binary.split(/[\\/]/).at(-1) === 'firebase' && args[0] === 'deploy') throw new HostingCliError(error);
+    throw new Error(`Command failed: ${binary.split(/[\\/]/).at(-1)} ${args[0] || ''}; raw output withheld`);
+  }
 }
 
 export function realAdapter(root, env, dependencies = {}) {
@@ -87,6 +93,19 @@ export function realAdapter(root, env, dependencies = {}) {
       assert.equal(site.defaultUrl, ORIGIN);
     },
     live,
+    diagnosticState: async () => {
+      // GET only; observe candidates, never infer ownership or a CLI-internal stage.
+      const channel = await json(`${API}sites/${SITE}/channels/live`);
+      const versions = [];
+      let token = '';
+      for (let page = 0; page < 3; page++) {
+        const result = await json(`${API}sites/${SITE}/versions?pageSize=100${token ? `&pageToken=${encodeURIComponent(token)}` : ''}`);
+        versions.push(...(result.versions || []).map(versionObservation));
+        token = result.nextPageToken || '';
+        if (!token) break;
+      }
+      return { observedAt: new Date().toISOString(), release: channel.release, versions, truncated: Boolean(token) };
+    },
     history: async (previous) => {
       const all = [];
       let token = '';
@@ -120,9 +139,12 @@ export function realAdapter(root, env, dependencies = {}) {
       const cli = join(root, 'tools/hosting-cli/node_modules/.bin/firebase');
       assert.equal(command(cli, ['--version'], { cwd: root }).trim(), CLI_VERSION);
       assert(!env.FIREBASE_TOKEN && !env.GOOGLE_CREDENTIALS, 'legacy/key authentication forbidden');
-      const output = JSON.parse(command(cli, ['deploy', '--only', 'hosting', '--project', PROJECT, '--non-interactive', '--json',
-        '--message', `sha=${env.GITHUB_SHA} run=${env.GITHUB_RUN_ID} attempt=${env.GITHUB_RUN_ATTEMPT}`], { cwd: root }));
-      assert.equal(output.status, 'success', 'Firebase CLI did not report success');
+      let output;
+      try {
+        output = JSON.parse(command(cli, ['deploy', '--only', 'hosting', '--project', PROJECT, '--non-interactive', '--json',
+          '--message', `sha=${env.GITHUB_SHA} run=${env.GITHUB_RUN_ID} attempt=${env.GITHUB_RUN_ATTEMPT}`], { cwd: root }));
+        if (output.status !== 'success') throw new HostingCliError(output);
+      } catch (error) { throw error instanceof HostingCliError ? error : new HostingCliError(error); }
       assert.match(output.result?.hosting || '', new RegExp(`^sites/${SITE}/versions/[A-Za-z0-9_-]+$`), 'CLI must identify this deployment version');
       return output.result.hosting;
     },
@@ -175,8 +197,29 @@ export async function runHosting(adapter, env, record = () => {}) {
   const message = `sha=${env.GITHUB_SHA} run=${env.GITHUB_RUN_ID} attempt=${env.GITHUB_RUN_ATTEMPT}`;
   const started = Date.now();
   let candidate;
-  const version = await adapter.deploy();
+  async function observe() {
+    try {
+      return adapter.diagnosticState ? await adapter.diagnosticState() : { release: await adapter.live(), versionsUnavailable: true };
+    } catch (error) { return { unavailable: true, diagnosis: sanitizeCliFailure(error, 'diagnostic-read') }; }
+  }
+  const beforeCli = await observe();
+  record('cli-start', { stage: 'cli-start', started, source, state: beforeCli });
+  assert(sameRelease(previous, await adapter.live()), 'concurrent Hosting deployment during diagnostic snapshot');
+  let version;
+  try { version = await adapter.deploy(); }
+  catch (error) {
+    const failure = error instanceof HostingCliError ? error : new HostingCliError(error);
+    const afterCli = await observe();
+    const known = new Set((beforeCli.versions || []).map((v) => v.name));
+    record('cli-failure', { stage: 'cli-failed', diagnosis: failure.diagnosis, before: beforeCli, after: afterCli,
+      // Differences are observations, not proof of ownership under concurrency.
+      newlyObservedVersions: (afterCli.versions || []).filter((v) => !known.has(v.name)),
+      comparisonComplete: !beforeCli.unavailable && !beforeCli.truncated && !beforeCli.versionsUnavailable && !afterCli.unavailable && !afterCli.truncated,
+      internalCliStage: 'unknown', rollback: 'not attempted: CLI ownership not established' });
+    throw failure;
+  }
   record('cli-version', { version, message, started });
+  record('stage', { stage: 'post-deploy-verify', version });
   try {
     candidate = await adapter.live();
     assertCandidate(candidate, version, message, started);
@@ -190,7 +233,7 @@ export async function runHosting(adapter, env, record = () => {}) {
     record('result', { status: 'verified', source, release: final, previous });
     return { mode: 'deploy', source, release: final, previous };
   } catch (error) {
-    const result = { status: 'failed', reason: error.message, version, previous };
+    const result = { status: 'failed', diagnosis: sanitizeCliFailure(error, 'post-deploy-verify'), version, previous };
     // Never restore over a release owned by another run or an intervening deployment.
     try {
       const live = await adapter.live();
@@ -198,10 +241,12 @@ export async function runHosting(adapter, env, record = () => {}) {
       assert(candidate && sameRelease(live, candidate), 'candidate ownership not established; manual inspection required');
       assertExclusiveHistory(await adapter.history(previous), previous, candidate);
     } catch (guardError) {
-      result.rollback = `not attempted: ${guardError.message}`;
+      result.rollback = 'not attempted: ownership/concurrency guard failed';
+      result.rollbackDiagnosis = sanitizeCliFailure(guardError, 'post-deploy-verify');
       record('result', result);
       throw new Error(`Hosting failed: ${error.message}; rollback ${result.rollback}`);
     }
+    let rollbackFailure;
     try {
       const rollback = await adapter.rollback(previous, `rollback ${message}`);
       const restored = await adapter.live();
@@ -216,10 +261,13 @@ export async function runHosting(adapter, env, record = () => {}) {
       assert(sameRelease(restored, await adapter.live()), 'live changed during rollback verification');
       result.rollback = 'verified: previous version and entrypoint/JS/CSS hashes restored';
     } catch (rollbackError) {
-      result.rollback = `FAILED: ${rollbackError.message}; manual recovery required`;
+      rollbackFailure = rollbackError.message;
+      result.rollback = 'FAILED: manual recovery required';
+      result.rollbackDiagnosis = sanitizeCliFailure(rollbackError, 'post-deploy-verify');
     }
     record('result', result);
-    throw new Error(`Hosting failed: ${error.message}; rollback ${result.rollback}`);
+    // Detailed errors remain in sanitized evidence; callers still receive the guard failure.
+    throw new Error(`Hosting failed: ${error.message}; rollback ${rollbackFailure ? `FAILED: ${rollbackFailure}; manual recovery required` : result.rollback}`);
   }
 }
 
@@ -238,5 +286,8 @@ async function main() {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  main().catch((error) => { console.error(error.message); process.exitCode = 1; });
+  main().catch((error) => {
+    console.error(JSON.stringify(error instanceof HostingCliError ? error.diagnosis : sanitizeCliFailure(error, 'unknown')));
+    process.exitCode = 1;
+  });
 }
