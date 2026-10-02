@@ -37,6 +37,37 @@ jobs:
         run: node --test tests/request-limit.mjs
       - name: Deployment safety regression (mock GCP commands only)
         run: node --test tests/deployment-regression.mjs
+      - name: Teacher confirmation frontend regression (mock APIs only)
+        run: node --test tests/frontend-class-auth.mjs
+      - name: Hosting safety regression (mock commands/APIs only)
+        run: node --test tests/hosting-regression.mjs
+      - name: Verify new Hosting build artifact
+        run: node scripts/deploy-hosting.mjs artifact
+      - name: Validate workflow YAML and inline shell syntax
+        run: |
+          ruby -ryaml -e 'Dir[".github/workflows/*.yml"].each { |p| YAML.load_file(p); puts "YAML PASS: #{p}" }'
+          python3 - <<'PY'
+          import pathlib, subprocess
+          for path in pathlib.Path('.github/workflows').glob('*.yml'):
+              text = path.read_text()
+              blocks = []
+              lines = text.splitlines()
+              for i, line in enumerate(lines):
+                  if line.strip() == 'run: |':
+                      indent = len(line) - len(line.lstrip())
+                      block = []
+                      for candidate in lines[i + 1:]:
+                          if candidate.strip() and len(candidate) - len(candidate.lstrip()) <= indent:
+                              break
+                          block.append(candidate[indent + 2:])
+                      blocks.append('\n'.join(block))
+              for block in blocks:
+                  subprocess.run(['bash', '-n'], input=block, text=True, check=True)
+              print(f'Inline shell PASS: {path}')
+          PY
+          bash -n scripts/deploy-production.sh
+          git ls-files -z '*.mjs' '*.cjs' | xargs -0 -r -n1 node --check
+          git diff --check
 
   secret-scan:
     name: Gitleaks
@@ -52,3 +83,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           GITLEAKS_ENABLE_COMMENTS: 'false'
           GITLEAKS_ENABLE_UPLOAD_ARTIFACT: 'false'
+      - name: Gitleaks directory and full history
+        run: |
+          gitleaks dir . --redact --no-banner
+          gitleaks git . --log-opts=--all --redact --no-banner

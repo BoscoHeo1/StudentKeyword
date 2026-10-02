@@ -1,0 +1,7 @@
+{
+  "name": "studentkeyword-hosting-cli",
+  "version": "1.0.0",
+  "private": true,
+  "engines": { "node": ">=24 <25" },
+  "dependencies": { "firebase-tools": "15.32.0" }
+}

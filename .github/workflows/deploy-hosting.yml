@@ -1,0 +1,77 @@
+name: Deploy Hosting manually
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Validate reads only; deploy builds and publishes Hosting only'
+        required: true
+        type: choice
+        options: [validate, deploy]
+        default: validate
+      confirm_sha:
+        description: 'Complete current main SHA, required for both modes'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+concurrency:
+  group: studentkeyword-hosting-production
+  cancel-in-progress: false
+
+jobs:
+  hosting:
+    if: github.repository == 'BoscoHeo1/StudentKeyword' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: hosting-production
+    env:
+      MODE: ${{ inputs.mode }}
+      CONFIRM_SHA: ${{ inputs.confirm_sha }}
+      GH_TOKEN: ${{ github.token }}
+      HOSTING_DEPLOY_ENABLED: ${{ vars.HOSTING_DEPLOY_ENABLED }}
+      HOSTING_SERVICE_ACCOUNT: studentkeyword-hosting-deploy@mykeyword-a832f.iam.gserviceaccount.com
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Confirm exact current main and successful Verify source
+        run: node scripts/deploy-hosting.mjs source
+      - name: Require reviewed Hosting identity configuration
+        env:
+          HOSTING_WIF_PROVIDER: ${{ vars.HOSTING_WIF_PROVIDER }}
+        run: |
+          set -euo pipefail
+          test "$HOSTING_WIF_PROVIDER" = 'projects/783209447753/locations/global/workloadIdentityPools/studentkeyword-github/providers/github-main-hosting'
+          if [[ "$MODE" == deploy ]]; then
+            test "$HOSTING_DEPLOY_ENABLED" = true
+          fi
+      - name: Authenticate Hosting identity without a JSON key
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: mykeyword-a832f
+          workload_identity_provider: ${{ vars.HOSTING_WIF_PROVIDER }}
+          service_account: studentkeyword-hosting-deploy@mykeyword-a832f.iam.gserviceaccount.com
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
+      - name: Install locked Hosting CLI only in deploy mode
+        if: inputs.mode == 'deploy'
+        run: npm ci --prefix tools/hosting-cli --ignore-scripts --no-audit --no-fund
+      - name: Validate reads only or build and deploy Hosting only
+        run: node scripts/deploy-hosting.mjs "$MODE"
+      - name: Preserve sanitized deployment evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hosting-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/studentkeyword-hosting-evidence/*.json
+          if-no-files-found: ignore
+          retention-days: 90
