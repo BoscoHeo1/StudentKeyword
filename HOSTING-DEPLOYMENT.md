@@ -10,10 +10,14 @@ Neither PR is merged by this automation. No Hosting, Cloud Run, IAM, WIF,
 Secret, Rules or student data changes were performed to implement this PR.
 
 Known production backend: `studentkeyword-api-00009-klk`, 100% traffic.
-Known live Hosting release: `1790142455605000`, version `255f0b036e92c215`.
-That frontend does not contain the Phase 3A explicit class creation UI.
-Implementing or merging this workflow alone does not repair the live frontend.
-A separately authorized Hosting deployment is required.
+Known live Hosting release as of 2026-10-02: `1790905167120000`, version
+`bc5d0e56907522b3` (FINALIZED), published from main
+`7b41185ad7065d437ff47de7b3e2e685004b64f2` by run `36951909306`, attempt 1.
+The live HTML/JS/CSS hashes match that build and all four Phase 3A markers exist.
+The workflow failed **after successful publication** at its CLI version-result
+assertion; this patch neither redeploys nor rolls back. The gate stays false.
+Previous version `255f0b036e92c215` is retained FINALIZED; versions
+`1542108060035189` and `79d3ace130147077` remain ABANDONED.
 
 ## Manual workflow and gates
 
@@ -215,9 +219,14 @@ The supplementary dist guard requires `CLASS_NOT_FOUND`, `/api/classes/create`,
 all public file paths, sizes and uncompressed SHA-256 hashes, rejects unexpected
 files/symlinks, and checks that HTML references existing JS/CSS files.
 
-After publish, the controller requires the version returned by the pinned CLI's
-JSON result, the exact unique release message, a server release time no earlier
-than publication start, and that version as the current live version. It GETs
+After publish, the controller always requires server-side proof: the exact
+unique SHA/run/attempt message, release time no earlier than publication start,
+a safe FINALIZED live version, and exclusive live release history since baseline.
+A nonempty CLI version must also match that exact live version. When the supported
+success payload supplies no candidate, the live version can be nominated only
+after those server checks **and all artifact hashes** agree. Missing baseline,
+foreign/intervening release, wrong site/time/message, malformed payload or hash
+mismatch fails closed; a CLI success status alone never establishes ownership. It GETs
 `/` and every local public file, compares hashes, and GETs `/api/config` (410).
 Matching all JS bytes also verifies the checked Phase 3A markers. It calls no
 class auth/create/student-write endpoint. It rechecks live ownership/history
@@ -262,8 +271,8 @@ old entrypoint/JS/CSS hashes and unchanged live ownership. A rollback API or
 verification failure is explicitly reported; the job remains failed even when
 rollback succeeds. No `|| true` masks recovery failures.
 
-If CLI publication fails without a reliable version result, ownership cannot
-be established. If another deployment intervenes, automatic rollback is refused.
+If the CLI exits unsuccessfully or its response is malformed/unsupported,
+ownership cannot be established by the success fallback. If another deployment intervenes, automatic rollback is refused.
 Use the preserved evidence for separately authorized manual recovery:
 
 1. Confirm saved previous version is retained/FINALIZED and safe rewrites remain.
@@ -315,3 +324,50 @@ branch. No actual Gemini smoke test or real production validate/deploy is run.
 - [WIF deployment pipeline identities](https://docs.cloud.google.com/iam/docs/workload-identity-federation-with-deployment-pipelines)
 
 - [Cloud Run v2 service GET](https://docs.cloud.google.com/run/docs/reference/rest/v2/projects.locations.services/get)
+
+## CLI success result parsing fix (follow-up to run 36951909306)
+
+The pinned npm 15.32.0 tarball (gitHead
+`2b3a61f93d1273adf5874b10d71a8d51e4b3da23`, SHA-1
+`561c60680c137da07a704fd59ac38d6dc5098cf4`) was inspected without executing deploy.
+Its `lib/command.js` wraps the action return in
+`{ "status": "success", "result": ... }`.
+`lib/deploy/index.js` returns `{ hosting: versionNames.length === 1 ?
+versionNames[0] : versionNames }`: one string or an array of version resources.
+The corresponding tag source confirms this. It does not return nested
+`hosting.site`, `hosting.version` or target-keyed objects.
+
+The former wrapper only accepted a scalar string in `output.result.hosting`.
+It could not accept the source-defined array variant or a success result with
+no version. The raw success stdout from run 36951909306 was deliberately not
+retained. Therefore its exact field value and which variant failed cannot be
+reconstructed; do not label the fixture as captured stdout or claim it was an
+array. The fixture combines source-derived JSON shapes with independently
+observed release/version/message/time/hash facts from that run. Upstream tests
+were inspected separately; the local fixture is explicitly our reconstruction.
+
+`extractHostingVersionFromCliResult` reads only the exact status/result/hosting
+path. It accepts a scalar or singleton array for `sites/mykeyword-a832f/versions/ID`.
+Absent hosting (serialization of undefined) or an empty array returns null,
+which requires the stronger server/history/hash proof above. Missing result,
+null/nested object, unknown result products, bad JSON, wrong site/project,
+invalid resource or multiple entries (even duplicates) are rejected. Arbitrary
+string scanning is prohibited. It retains no payload or raw token/error text;
+JSON size is bounded and assertion messages do not echo received values.
+
+No-version fallback nominates the safe live version only within this run's
+unique message/time/history boundary. Before artifact proof it is ineligible
+for automatic rollback. After proof, final live and history checks must still
+match; existing guarded rollback semantics remain for established candidates.
+The history guard detects observable concurrency; no atomic lock against
+external writers is claimed. An actual CLI error still follows sanitized
+GET-only failure observations and never uses this fallback.
+
+This follow-up changes no workflow, CLI version/lock, IAM/WIF or production.
+Review its new PR and CI before a separately authorized merge. Do not dispatch
+another deploy to test it: the current frontend is already verified live.
+
+Sources:
+- [15.32.0 deploy result](https://github.com/firebase/firebase-tools/blob/v15.32.0/src/deploy/index.ts)
+- [15.32.0 JSON envelope](https://github.com/firebase/firebase-tools/blob/v15.32.0/src/command.ts)
+- [Pinned npm package metadata](https://registry.npmjs.org/firebase-tools/15.32.0)

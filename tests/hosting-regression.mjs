@@ -9,6 +9,7 @@ import {
   artifactManifest, validateLive, hash,
 } from '../scripts/hosting-safety.mjs';
 import { runHosting, realAdapter, sanitizeEvidence } from '../scripts/deploy-hosting.mjs';
+import { extractHostingVersionFromCliResult } from '../scripts/hosting-cli-result.mjs';
 import { HostingCliError, sanitizeCliFailure, versionObservation } from '../scripts/hosting-diagnostics.mjs';
 
 const config = JSON.parse(readFileSync(new URL('../firebase.json', import.meta.url)));
@@ -502,4 +503,126 @@ test('validate refuses an unexpected Hosting identity before the Cloud Run GET',
   const f = fixture();
   await assert.rejects(runHosting(f.adapter, { ...env, MODE: 'validate', HOSTING_SERVICE_ACCOUNT: 'other' }), /unexpected Hosting identity/);
   assert(!f.calls.includes('cloud-run-read')); assert(!f.calls.includes('deploy'));
+});
+
+// The CLI fixture is source-derived, not the unretained stdout of this run.
+// 15.32.0 deploy/index emits {hosting: string | string[]}; command.js wraps it.
+const publishedCase = {
+  sha: '7b41185ad7065d437ff47de7b3e2e685004b64f2', run: '36951909306', attempt: '1',
+  started: Date.parse('2026-10-02T01:39:22.988Z'),
+  release: {
+    name: 'sites/mykeyword-a832f/channels/live/releases/1790905167120000',
+    version: { name: 'sites/mykeyword-a832f/versions/bc5d0e56907522b3', status: 'FINALIZED', config: { rewrites } },
+    message: 'sha=7b41185ad7065d437ff47de7b3e2e685004b64f2 run=36951909306 attempt=1',
+    releaseTime: '2026-10-02T01:39:27.120Z',
+  },
+  files: [
+    { path: '/index.html', sha256: '6ce9208bf7c2a5ddd0f61ba3099e4d139ed75a221d1e2734de59194922ff85ed' },
+    { path: '/assets/index-Cx6h9tsn.js', sha256: '56c5fa606b6d9b40668ed7a7bea20eb99eb5531e6e4bc02ad9734e7fefcfb15e' },
+    { path: '/assets/index-DQppnrwS.css', sha256: '08b7e9316eec05a96621d6f0cfdd54f08c78bb71284697edcc709bb8121c08ad' },
+  ],
+};
+const cliPayload = (hosting = publishedCase.release.version.name) => ({ status: 'success', result: { hosting } });
+
+test('15.32.0 source-derived scalar payload extracts the observed version', () => {
+  assert.equal(extractHostingVersionFromCliResult(JSON.stringify(cliPayload())), publishedCase.release.version.name);
+});
+test('15.32.0 singleton version array is accepted', () => {
+  assert.equal(extractHostingVersionFromCliResult(cliPayload([publishedCase.release.version.name])), publishedCase.release.version.name);
+});
+for (const [label, result] of [['absent field', {}], ['empty source array', { hosting: [] }]]) {
+  test('CLI ' + label + ' requires server proof', () => {
+    assert.equal(extractHostingVersionFromCliResult({ status: 'success', result }), null);
+  });
+}
+for (const [label, payload] of [
+  ['malformed JSON', '{broken'],
+  ['null envelope', null],
+  ['array envelope', []],
+  ['error status', { status: 'error', result: { hosting: publishedCase.release.version.name } }],
+  ['null result', { status: 'success', result: null }],
+  ['array result', { status: 'success', result: [] }],
+  ['nested site/version object', cliPayload({ site: SITE, version: publishedCase.release.version.name })],
+  ['target object', cliPayload({ target: publishedCase.release.version.name })],
+  ['null version', cliPayload(null)],
+  ['numeric version', cliPayload(123)],
+  ['wrong site', cliPayload('sites/other/versions/123')],
+  ['project-prefixed version', cliPayload('projects/other/sites/mykeyword-a832f/versions/123')],
+  ['empty version ID', cliPayload('sites/mykeyword-a832f/versions/')],
+  ['arbitrary text containing version', cliPayload('prefix ' + publishedCase.release.version.name)],
+  ['query/token suffix', cliPayload(publishedCase.release.version.name + '?token=fixture')],
+  ['multiple sites', cliPayload([publishedCase.release.version.name, 'sites/other/versions/123'])],
+  ['duplicate multiple candidates', cliPayload([publishedCase.release.version.name, publishedCase.release.version.name])],
+  ['other product result', { status: 'success', result: { hosting: publishedCase.release.version.name, firestore: {} } }],
+]) test('CLI result rejects ' + label + ' without scanning', () => {
+  assert.throws(() => extractHostingVersionFromCliResult(payload));
+});
+test('success parser errors retain no sensitive input strings', () => {
+  const payload = cliPayload(sensitive[8]); payload.token = sensitive[0];
+  assert.throws(() => extractHostingVersionFromCliResult(payload), (error) => {
+    noSecrets({ message: error.message, actual: error.actual, expected: error.expected }); return true;
+  });
+  assert.equal(extractHostingVersionFromCliResult({ ...cliPayload(), token: sensitive[0] }), publishedCase.release.version.name);
+});
+test('CLI JSON size bound withholds oversized output', () => {
+  assert.throws(() => extractHostingVersionFromCliResult(' '.repeat(1024 * 1024 + 1)), /too large/);
+});
+
+for (const [label, payload] of [
+  ['scalar', cliPayload()],
+  ['singleton array', cliPayload([publishedCase.release.version.name])],
+  ['no candidate', { status: 'success', result: {} }],
+]) test('published case with CLI ' + label + ' verifies server history and hashes', async (t) => {
+  t.mock.method(Date, 'now', () => publishedCase.started);
+  const f = fixture(); const live = structuredClone(publishedCase.release);
+  const real = realAdapter('/mock', env, { command: (binary, args) =>
+    args[0] === '--version' ? CLI_VERSION : JSON.stringify(payload) });
+  f.adapter.source = () => ({ sha: publishedCase.sha });
+  f.adapter.build = () => ({ files: publishedCase.files });
+  f.adapter.deploy = () => { f.calls.push('deploy'); f.setLive(live); f.setHistory([live, f.old]); return real.deploy(); };
+  f.adapter.smoke = async (manifest, api) => {
+    assert.deepEqual(manifest.files, publishedCase.files); assert.equal(api, true); f.calls.push('smoke');
+  };
+  await runHosting(f.adapter, { ...env, GITHUB_SHA: publishedCase.sha, GITHUB_RUN_ID: publishedCase.run,
+    GITHUB_RUN_ATTEMPT: publishedCase.attempt }, (name, data) => { f.records[name] = data; });
+  assert.equal(f.records.result.status, 'verified'); assert.equal(f.records.result.release.name, publishedCase.release.name);
+  assert.equal(f.records.candidate.identification, label === 'no candidate' ? 'server-history-and-hashes' : 'cli-and-server');
+  assert(!f.calls.includes('rollback')); assert.equal(f.calls.filter((c) => c === 'deploy').length, 1);
+});
+
+function noVersionFixture() {
+  const f = fixture(); const deploy = f.adapter.deploy;
+  f.adapter.deploy = async () => { await deploy(); return null; };
+  return f;
+}
+for (const [label, mutate, pattern] of [
+  ['foreign live release', (f) => f.setLive(release('foreign', 'v2', 'other run')), /release message mismatch/],
+  ['message mismatch', (f) => { const r = structuredClone(f.candidate); r.message = 'other run'; f.setLive(r); }, /release message mismatch/],
+  ['stale release time', (f) => { const r = structuredClone(f.candidate); r.releaseTime = '2000-01-01T00:00:00Z'; f.setLive(r); }, /predates/],
+  ['wrong site', (f) => { const r = structuredClone(f.candidate); r.version.name = 'sites/other/versions/v1'; f.setLive(r); }, /match/],
+  ['non-finalized version', (f) => { const r = structuredClone(f.candidate); r.version.status = 'CREATED'; f.setLive(r); }, /finalized/],
+  ['intervening release', (f) => f.setHistory([f.candidate, release('foreign', 'v2'), f.old]), /concurrent Hosting/],
+  ['missing prior history', (f) => f.setHistory([f.candidate]), /previous release absent/],
+]) test('server fallback rejects ' + label + ' with no unproven rollback', async () => {
+  const f = noVersionFixture(); const deploy = f.adapter.deploy;
+  f.adapter.deploy = async () => { const result = await deploy(); mutate(f); return result; };
+  await assert.rejects(f.execute(), pattern); assert(!f.calls.includes('rollback')); assert.notEqual(f.records.result?.status, 'verified');
+});
+test('fallback hash mismatch establishes no candidate or rollback ownership', async () => {
+  const f = noVersionFixture(); f.adapter.smoke = async () => { throw new Error('live hash mismatch'); };
+  await assert.rejects(f.execute(), /rollback not attempted/);
+  assert(!f.records.candidate); assert(!f.calls.includes('rollback'));
+});
+test('foreign release during fallback smoke is never overwritten', async () => {
+  const f = noVersionFixture(); f.adapter.smoke = async () => { f.setLive(release('foreign', 'v2', 'other run')); };
+  await assert.rejects(f.execute(), /mismatch/); assert(!f.calls.includes('rollback'));
+});
+test('intervening history after fallback smoke fails closed', async () => {
+  const f = noVersionFixture(); f.adapter.smoke = async () => { f.setHistory([f.candidate, release('foreign', 'v2'), f.old]); };
+  await assert.rejects(f.execute(), /concurrent Hosting/); assert(!f.calls.includes('rollback'));
+});
+test('malformed CLI JSON is sanitized with no raw stdout/stderr', () => {
+  const adapter = realAdapter('/mock', env, { command: (binary, args) =>
+    args[0] === '--version' ? CLI_VERSION : '{broken ' + sensitive[8] });
+  assert.throws(() => adapter.deploy(), (error) => { noSecrets(error); noSecrets({ message: error.message }); return true; });
 });
