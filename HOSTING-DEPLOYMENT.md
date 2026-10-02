@@ -279,6 +279,25 @@ Use the preserved evidence for separately authorized manual recovery:
 Rollback restores Hosting content/configuration only. In the guarded unpinned
 configuration it does not deploy or change Cloud Run, Rules, IAM, secrets or data.
 
+## Read-only Cloud Run validation
+
+The manual `validate` mode also uses the existing Hosting OIDC/WIF credential
+for an empty-body Cloud Run v2 GET of
+`projects/mykeyword-a832f/locations/asia-northeast3/services/studentkeyword-api`.
+The returned service name must match exactly; wrong project, region, service,
+missing name, HTTP 403, or network failure prevents validation success.
+`cloud-run-read.json` records the fixed resource, GET method, `run.services.get`
+and a verified/failed status, with sanitized failure diagnosis. Runtime service
+configuration and raw response/error bodies are not retained in evidence.
+This check runs only in validate mode; deploy mode is unchanged.
+
+After this change is reviewed and merged, confirm main CI is successful and run
+`Deploy Hosting manually` from main with `mode=validate` and `confirm_sha` equal
+to the full current main SHA. Keep `HOSTING_DEPLOY_ENABLED=false`. This verifies
+the real GitHub OIDC → Hosting WIF → Hosting SA → service GET path without
+building or deploying. A PR branch cannot substitute for this main-only check.
+Do not add IAM permissions automatically if it fails.
+
 ## Validation and sources
 
 Run existing lint/build/security/auth/request-limit/AI QA (51) checks plus the
@@ -294,3 +313,5 @@ branch. No actual Gemini smoke test or real production validate/deploy is run.
 - [Live channel inspection](https://firebase.google.com/docs/reference/hosting/rest/v1beta1/sites.channels/get)
 - [Release creation / version selection](https://firebase.google.com/docs/reference/hosting/rest/v1beta1/sites.releases/create)
 - [WIF deployment pipeline identities](https://docs.cloud.google.com/iam/docs/workload-identity-federation-with-deployment-pipelines)
+
+- [Cloud Run v2 service GET](https://docs.cloud.google.com/run/docs/reference/rest/v2/projects.locations.services/get)

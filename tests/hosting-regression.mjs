@@ -40,6 +40,7 @@ function fixture(overrides = {}) {
     source: () => { calls.push('source'); return { sha }; },
     project: async () => { calls.push('project'); },
     live: async () => { calls.push('live'); return live; },
+    cloudRunRead: async () => { calls.push('cloud-run-read'); return { status: 'verified' }; },
     history: async () => history,
     snapshot: async () => { calls.push('snapshot'); return previousFiles; },
     build: async () => { calls.push('build'); return artifact; },
@@ -410,4 +411,95 @@ test('release evidence never includes arbitrary old/foreign release messages', (
   const cleaned = sanitizeEvidence({ release: release('foreign', 'v2', sensitive[8]), stdout: sensitive[0],
     GOOGLE_APPLICATION_CREDENTIALS: sensitive[5], env: { SECRET: sensitive[8] } });
   noSecrets(cleaned); assert.equal(cleaned.release.message, '[withheld]');
+});
+
+
+const runResource = 'projects/mykeyword-a832f/locations/asia-northeast3/services/studentkeyword-api';
+const runUrl = `https://run.googleapis.com/v2/${runResource}`;
+function runReadAdapter(body, response = {}) {
+  const calls = [];
+  const adapter = realAdapter('/mock', env, {
+    command: (binary, args) => {
+      assert.equal(binary, 'gcloud'); assert.deepEqual(args, ['auth', 'print-access-token']);
+      return sensitive[0];
+    },
+    fetch: async (url, options) => {
+      calls.push({ url, method: options.method, body: options.body });
+      assert.equal(url, runUrl); assert.equal(options.method, 'GET'); assert.equal(options.body, undefined);
+      assert.equal(options.headers.Authorization, `Bearer ${sensitive[0]}`);
+      return { ok: true, status: 200, json: async () => body, ...response };
+    },
+  });
+  return { adapter, calls };
+}
+test('Cloud Run read uses the fixed v2 GET and retains only permission/resource evidence', async () => {
+  const f = runReadAdapter({ name: runResource, template: { env: sensitive[8] }, labels: { private: sensitive[8] } });
+  const result = await f.adapter.cloudRunRead();
+  assert.deepEqual(result, { status: 'verified', method: 'GET', permission: 'run.services.get', resource: runResource });
+  assert.deepEqual(f.calls, [{ url: runUrl, method: 'GET', body: undefined }]); noSecrets(result);
+});
+for (const [field, name] of [
+  ['project', 'projects/other/locations/asia-northeast3/services/studentkeyword-api'],
+  ['region', 'projects/mykeyword-a832f/locations/us-central1/services/studentkeyword-api'],
+  ['service', 'projects/mykeyword-a832f/locations/asia-northeast3/services/other'],
+]) test(`Cloud Run read rejects wrong ${field} before validate can succeed`, async () => {
+  const read = runReadAdapter({ name }); const f = fixture({ cloudRunRead: read.adapter.cloudRunRead });
+  await assert.rejects(f.execute('validate'), /unexpected project\/region\/service/);
+  assert.equal(f.records['cloud-run-read'].status, 'failed');
+  assert(!f.calls.some((c) => ['build', 'deploy', 'rollback'].includes(c))); assert.equal(read.calls.length, 1);
+});
+test('Cloud Run read rejects missing service name', async () => {
+  const f = runReadAdapter({}); await assert.rejects(f.adapter.cloudRunRead(), /unexpected project\/region\/service/);
+});
+test('validate reports HTTP 403 run.services.get without reading or printing the response body', async () => {
+  let parsed = false;
+  const read = runReadAdapter(undefined, { ok: false, status: 403, json: async () => { parsed = true; return { error: sensitive[8] }; } });
+  const f = fixture({ cloudRunRead: read.adapter.cloudRunRead });
+  await assert.rejects(f.execute('validate'), /run\.services\.get GET failed: HTTP 403/);
+  const evidence = f.records['cloud-run-read'];
+  assert.equal(evidence.status, 'failed'); assert.deepEqual(evidence.diagnosis.httpStatus, [403]);
+  assert.deepEqual(evidence.diagnosis.permissions, ['run.services.get']); assert.equal(evidence.resource, runResource);
+  assert.equal(parsed, false); noSecrets(sanitizeEvidence(evidence));
+  assert(!f.calls.some((c) => ['build', 'deploy', 'rollback'].includes(c)));
+});
+test('validate Cloud Run network failure fails closed with sanitized evidence', async () => {
+  const adapter = realAdapter('/mock', env, { command: () => sensitive[0], fetch: async () => { throw new Error(sensitive[8]); } });
+  const f = fixture({ cloudRunRead: adapter.cloudRunRead });
+  await assert.rejects(f.execute('validate')); assert.equal(f.records['cloud-run-read'].status, 'failed');
+  noSecrets(sanitizeEvidence(f.records)); assert(!f.calls.includes('deploy'));
+});
+test('validate performs Hosting and Cloud Run GETs only while the deployment gate is false', async () => {
+  const requests = [], commands = []; const old = release('old', 'v0');
+  const adapter = realAdapter('/mock', env, {
+    command: (binary, args) => { commands.push({ binary, args }); return sensitive[0]; },
+    fetch: async (url, options) => {
+      requests.push({ url, method: options.method, body: options.body });
+      assert.equal(options.method, 'GET'); assert.equal(options.body, undefined);
+      let body;
+      if (url.endsWith(`/projects/${PROJECT}/sites/${SITE}`)) body = { name: `projects/${PROJECT}/sites/${SITE}`, defaultUrl: `https://${SITE}.web.app` };
+      else if (url.endsWith('/channels/live')) body = { name: `sites/${SITE}/channels/live`, release: old };
+      else if (url.endsWith('/versions/v0')) body = old.version;
+      else if (url === runUrl) body = { name: runResource };
+      else throw new Error('unexpected request');
+      return { ok: true, status: 200, json: async () => body };
+    },
+  });
+  // Existing source/config gates are covered above; exercise the actual API adapters here.
+  const f = fixture({ project: adapter.project, live: adapter.live, cloudRunRead: adapter.cloudRunRead });
+  const result = await runHosting(f.adapter, { ...env, MODE: 'validate', HOSTING_DEPLOY_ENABLED: 'false' },
+    (name, data) => { f.records[name] = data; });
+  assert.equal(result.cloudRunRead.status, 'verified'); assert.equal(requests.length, 4);
+  assert.deepEqual(commands, [{ binary: 'gcloud', args: ['auth', 'print-access-token'] }]);
+  assert(!f.calls.some((c) => ['build', 'snapshot', 'deploy', 'rollback'].includes(c)));
+  assert.equal(f.records['cloud-run-read'].resource, runResource); noSecrets(sanitizeEvidence(f.records));
+});
+test('deploy mode does not invoke the new Cloud Run read path', async () => {
+  const f = fixture({ cloudRunRead: () => { throw new Error('validate-only read called in deploy'); } });
+  const result = await f.execute(); assert.equal(result.mode, 'deploy');
+  assert.equal(f.records['cloud-run-read'], undefined); assert(f.calls.includes('deploy'));
+});
+test('validate refuses an unexpected Hosting identity before the Cloud Run GET', async () => {
+  const f = fixture();
+  await assert.rejects(runHosting(f.adapter, { ...env, MODE: 'validate', HOSTING_SERVICE_ACCOUNT: 'other' }), /unexpected Hosting identity/);
+  assert(!f.calls.includes('cloud-run-read')); assert(!f.calls.includes('deploy'));
 });

@@ -12,6 +12,7 @@ import {
 
 const API = 'https://firebasehosting.googleapis.com/v1beta1/';
 const ORIGIN = `https://${SITE}.web.app`;
+const RUN_SERVICE = `projects/${PROJECT}/locations/asia-northeast3/services/studentkeyword-api`;
 
 export function sanitizeEvidence(value) {
   if (Array.isArray(value)) return value.map(sanitizeEvidence);
@@ -40,13 +41,13 @@ export function realAdapter(root, env, dependencies = {}) {
   const command = dependencies.command || defaultCommand;
   const fetch = dependencies.fetch || globalThis.fetch;
   let accessToken;
-  async function json(url, method = 'GET', body) {
+  async function json(url, method = 'GET', body, label = 'Hosting API') {
     if (!accessToken) accessToken = command('gcloud', ['auth', 'print-access-token']).trim();
     const response = await fetch(url, {
       method, headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
       ...(body ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(15000),
     });
-    assert(response.ok, `Hosting API ${method} failed: HTTP ${response.status}`);
+    assert(response.ok, `${label} ${method} failed: HTTP ${response.status}`);
     return response.json();
   }
   async function live() {
@@ -93,6 +94,14 @@ export function realAdapter(root, env, dependencies = {}) {
       assert.equal(site.defaultUrl, ORIGIN);
     },
     live,
+    cloudRunRead: async () => {
+      // Reuse the Hosting OIDC credential. Fixed endpoint, empty-body GET only.
+      const service = await json(`https://run.googleapis.com/v2/${RUN_SERVICE}`,
+        'GET', undefined, 'Cloud Run run.services.get');
+      assert(service?.name === RUN_SERVICE, 'Cloud Run GET returned an unexpected project/region/service');
+      // Do not retain the full Service: its runtime config may contain private values.
+      return { status: 'verified', method: 'GET', permission: 'run.services.get', resource: RUN_SERVICE };
+    },
     diagnosticState: async () => {
       // GET only; observe candidates, never infer ownership or a CLI-internal stage.
       const channel = await json(`${API}sites/${SITE}/channels/live`);
@@ -181,7 +190,19 @@ export async function runHosting(adapter, env, record = () => {}) {
   await adapter.project();
   const previous = await adapter.live();
   record('previous', { source, release: previous });
-  if (env.MODE === 'validate') return { mode: 'validate', source, previous };
+  if (env.MODE === 'validate') {
+    let cloudRunRead;
+    try {
+      assert.equal(env.HOSTING_SERVICE_ACCOUNT, HOSTING_SA, 'unexpected Hosting identity');
+      cloudRunRead = await adapter.cloudRunRead();
+    } catch (error) {
+      record('cloud-run-read', { status: 'failed', method: 'GET', permission: 'run.services.get', resource: RUN_SERVICE,
+        diagnosis: sanitizeCliFailure(error, 'diagnostic-read') });
+      throw error;
+    }
+    record('cloud-run-read', cloudRunRead);
+    return { mode: 'validate', source, previous, cloudRunRead };
+  }
   assert.equal(env.HOSTING_DEPLOY_ENABLED, 'true', 'deployment disabled until identity and environment review');
   assert.equal(env.HOSTING_SERVICE_ACCOUNT, HOSTING_SA, 'unexpected Hosting identity');
   assert.match(env.GITHUB_RUN_ID || '', /^\d+$/);
