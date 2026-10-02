@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { extractHostingVersionFromCliResult } from './hosting-cli-result.mjs';
 import { HostingCliError, sanitizeCliFailure, versionObservation } from './hosting-diagnostics.mjs';
 import {
   PROJECT, SITE, REPOSITORY, CLI_VERSION, HOSTING_SA, hash, assetPaths,
@@ -154,8 +155,7 @@ export function realAdapter(root, env, dependencies = {}) {
           '--message', `sha=${env.GITHUB_SHA} run=${env.GITHUB_RUN_ID} attempt=${env.GITHUB_RUN_ATTEMPT}`], { cwd: root }));
         if (output.status !== 'success') throw new HostingCliError(output);
       } catch (error) { throw error instanceof HostingCliError ? error : new HostingCliError(error); }
-      assert.match(output.result?.hosting || '', new RegExp(`^sites/${SITE}/versions/[A-Za-z0-9_-]+$`), 'CLI must identify this deployment version');
-      return output.result.hosting;
+      return extractHostingVersionFromCliResult(output);
     },
     smoke: async (manifest, checkApi) => {
       // Every expected file is fetched; no auth/create/student mutation endpoints.
@@ -239,14 +239,22 @@ export async function runHosting(adapter, env, record = () => {}) {
       internalCliStage: 'unknown', rollback: 'not attempted: CLI ownership not established' });
     throw failure;
   }
-  record('cli-version', { version, message, started });
+  record('cli-version', { version, identification: version === null ? 'server-required' : 'cli', message, started });
   record('stage', { stage: 'post-deploy-verify', version });
   try {
-    candidate = await adapter.live();
-    assertCandidate(candidate, version, message, started);
-    record('candidate', { source, release: candidate });
-    assertExclusiveHistory(await adapter.history(previous), previous, candidate);
-    await verifyFiles(adapter, artifact, true);
+    const observed = await adapter.live();
+    validateLive({ name: `sites/${SITE}/channels/live`, release: observed });
+    assert(version === null || typeof version === 'string', 'invalid CLI candidate evidence');
+    const serverIdentified = version === null;
+    if (serverIdentified) version = observed.version.name;
+    assertCandidate(observed, version, message, started);
+    assertExclusiveHistory(await adapter.history(previous), previous, observed);
+    // With no CLI version, do not establish ownership (or permit rollback)
+    // until server message/time/history AND all expected artifact bytes agree.
+    if (serverIdentified) await verifyFiles(adapter, artifact, true);
+    candidate = observed;
+    record('candidate', { source, release: candidate, identification: serverIdentified ? 'server-history-and-hashes' : 'cli-and-server' });
+    if (!serverIdentified) await verifyFiles(adapter, artifact, true);
     const final = await adapter.live();
     assertCandidate(final, version, message, started);
     assert(sameRelease(final, candidate), 'live release changed during smoke');
