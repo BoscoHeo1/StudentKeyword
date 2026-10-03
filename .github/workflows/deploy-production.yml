@@ -39,17 +39,7 @@ jobs:
           MODE: ${{ inputs.mode }}
           CONFIRM_SHA: ${{ inputs.confirm_sha }}
         run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)" = "$GITHUB_SHA"
-          if [[ "$MODE" == deploy ]]; then
-            test "$CONFIRM_SHA" = "$GITHUB_SHA"
-          fi
-          successful_runs="$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/verify.yml/runs" \
-            -f head_sha="$GITHUB_SHA" -f branch=main -f status=success \
-            --jq '.workflow_runs | length')"
-          test "$successful_runs" -ge 1
-          echo "Source commit: $GITHUB_SHA; Verify source: success; mode: $MODE"
+          node scripts/preflight-production.mjs
       - name: Authenticate to Google Cloud without a key
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
