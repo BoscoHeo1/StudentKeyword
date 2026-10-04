@@ -30,6 +30,43 @@ To undo this setup, remove the deploy account's service, registry, build, and se
 
 ## What a deploy run does
 
+### Preflight diagnosis (2026-10-03)
+
+Run `37005342773` failed in `Confirm main commit and successful CI` before Google
+authentication. Its log confirms checkout SHA but records neither the remote-main
+comparison nor the returned run count, so the exact failing predicate cannot be
+established retrospectively. No WIF/IAM failure is demonstrated by this run.
+
+Read-only public GitHub API checks confirmed main
+`e6904a688e366fdc06c7e552a60420e47868ea1f`, merged PR #6, and CI run
+`37005047820` (`Verify source`, main, completed/success). CI finished at
+2026-10-02 12:10:20 UTC, before the failed preflight at 12:12:52 UTC.
+The original `head_sha + branch=main + status=success` query returned exactly
+that run; `status=completed` and a head-SHA-only query also returned it.
+The `verify.yml` descriptor is active workflow `368043688` with the expected
+name/path. There is no evidence that these filters or filename identification
+caused the historical failure. GitHub supports a status OR conclusion value in
+the `status` query parameter, including `success`; see the
+[workflow runs API](https://docs.github.com/en/rest/actions/workflow-runs#list-workflow-runs-for-a-workflow).
+
+The former logic trusted the filtered list length without validating run fields
+or response shape and did not follow pagination. The new standalone helper
+`scripts/preflight-production.mjs` keeps exact checkout/current-main checks and
+the deploy confirmation gate. It requests completed runs for the SHA/main,
+validates the workflow descriptor and every run, and requires at least one run
+with exact head SHA, main branch, completed status and success conclusion.
+It uses explicit pages of 100, checks stable totals and unique IDs, and refuses
+incomplete/ambiguous results or totals beyond GitHub's 1,000 filtered-result cap.
+Both completed failures and in-progress runs cannot satisfy the gate.
+
+Diagnostics contain only mode, Boolean SHA/confirmation predicates, run count,
+success predicate, and fixed failure reason codes. Command errors and JSON
+payloads are not printed. No tokens, headers, credentials, secrets or environment
+dumps are logged. Tests inject GitHub responses and do not dispatch workflows or
+call Google services. This change does not claim to repair a proven API filter
+defect: it hardens the predicate and makes a later separately approved validate
+run diagnosable. Production deployment commands remain unchanged.
+
 1. Checks that the selected commit is the current public `main` and its `Verify source` workflow succeeded.
 2. Uses a keyless token and checks current production configuration. `validate` stops here without a build.
 3. For `deploy`, Cloud Build clones public `main`, verifies its exact SHA, and builds `sha-<full SHA>-r<run ID>-a<attempt>` in the existing Artifact Registry repository. A duplicate tag fails closed. The build ID and image digest are logged.

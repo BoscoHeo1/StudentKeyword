@@ -37,6 +37,8 @@ jobs:
         run: node --test tests/request-limit.mjs
       - name: Deployment safety regression (mock GCP commands only)
         run: node --test tests/deployment-regression.mjs
+      - name: Production source preflight regression (mock GitHub responses only)
+        run: node --test tests/preflight-production.mjs
       - name: Teacher confirmation frontend regression (mock APIs only)
         run: node --test tests/frontend-class-auth.mjs
       - name: Hosting safety regression (mock commands/APIs only)
